@@ -1,0 +1,24 @@
+{
+  "name": "vobiz-zoho-phonebridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VoBiz calling backend with the Zoho PhoneBridge V3 integration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test-zoho-phonebridge.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vobiz-ai/Vobiz-Zoho-Calling.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vobiz-ai/Vobiz-Zoho-Calling/issues"
+  },
+  "homepage": "https://github.com/vobiz-ai/Vobiz-Zoho-Calling#readme",
+  "author": "Vobiz"
+}

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Vobiz support
+    url: mailto:support@vobiz.ai
+    about: Accounts, phone numbers, billing, or anything about the Vobiz platform itself.
+  - name: Vobiz documentation
+    url: https://www.vobiz.ai/docs
+    about: API reference, XML reference, and integration guides.
+  - name: Report a security vulnerability
+    url: https://github.com/vobiz-ai/Vobiz-Zoho-Calling/blob/main/SECURITY.md
+    about: Please do not open a public issue for a security problem.

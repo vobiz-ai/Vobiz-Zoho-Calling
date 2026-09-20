@@ -1,0 +1,14 @@
+{
+  "test-agent": {
+    "displayName": "Test Agent One",
+    "sipUser": "YourEndpointUsername@registrar.vobiz.ai",
+    "sipPassword": "the-endpoint-password-from-the-vobiz-console",
+    "phoneNumber": "+91XXXXXXXXXX"
+  },
+  "test-agent-2": {
+    "displayName": "Test Agent Two",
+    "sipUser": "YourSecondEndpointUsername@registrar.vobiz.ai",
+    "sipPassword": "the-endpoint-password-from-the-vobiz-console",
+    "phoneNumber": "+91XXXXXXXXXX"
+  }
+}

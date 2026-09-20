@@ -1,0 +1,39 @@
+name: Bug report
+description: Something does not work as described.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please redact account ids, phone numbers, tokens and call UUIDs before posting.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: dial-result
+    attributes:
+      label: Backend log around the failure
+      description: >-
+        The DIAL RESULT line matters most. DialBLegUUID present means the call
+        connected; empty means no B leg was ever created, whatever the UI showed.
+      render: text
+  - type: input
+    id: direction
+    attributes:
+      label: Direction
+      placeholder: inbound or outbound
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      placeholder: "18.x"

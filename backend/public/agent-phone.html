@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vobiz agent phone</title>
+<style>
+  :root { color-scheme: dark; --bg:#14110f; --panel:#1e1a17; --line:#332c27;
+          --ink:#f3efec; --dim:#a2968d; --brand:#ff5722; --ok:#37b26a; --bad:#e0543d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  .wrap { max-width:420px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:15px; letter-spacing:.14em; text-transform:uppercase; color:var(--dim); margin:0 0 20px; font-weight:600; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:14px; }
+  .row { display:flex; align-items:center; gap:9px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); flex:none; }
+  .dot.on { background:var(--ok); box-shadow:0 0 0 3px rgba(55,178,106,.18); }
+  .dot.err { background:var(--bad); }
+  .status { font-weight:600; }
+  .sub { color:var(--dim); font-size:12px; margin-top:3px; word-break:break-all; }
+  label { display:block; font-size:11px; letter-spacing:.09em; text-transform:uppercase; color:var(--dim); margin:14px 0 5px; }
+  input { width:100%; padding:11px 12px; background:#171311; border:1px solid var(--line);
+          border-radius:7px; color:var(--ink); font-size:15px; font-family:inherit; }
+  input:focus { outline:none; border-color:var(--brand); }
+  button { width:100%; padding:12px; border:0; border-radius:7px; font-size:15px; font-weight:600;
+           font-family:inherit; cursor:pointer; margin-top:10px; }
+  .call { background:var(--brand); color:#fff; }
+  .call:disabled { background:#3a302b; color:#6d625b; cursor:not-allowed; }
+  .hangup { background:var(--bad); color:#fff; }
+  .ring { border-color:var(--brand); animation:pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { border-color:#4a3a33; } 50% { border-color:var(--brand); } }
+  @media (prefers-reduced-motion:reduce) { .ring { animation:none; border-color:var(--brand); } }
+  .ringlabel { font-size:11px; letter-spacing:.09em; text-transform:uppercase; color:var(--brand); font-weight:700; }
+  .ringfrom { font-size:19px; font-weight:600; margin:5px 0 13px; }
+  .ringbtns { display:flex; gap:9px; }
+  .ringbtns button { margin:0; }
+  .accept { background:var(--ok); color:#fff; }
+  .decline { background:#3a302b; color:var(--ink); }
+  .log { font:11px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--dim);
+         max-height:220px; overflow:auto; white-space:pre-wrap; }
+  .log b { color:var(--ink); font-weight:600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Vobiz agent phone</h1>
+
+  <div class="card">
+    <div class="row"><span class="dot" id="dot"></span><span class="status" id="status">Starting…</span></div>
+    <div class="sub" id="who"></div>
+  </div>
+
+  <div class="card ring" id="ringing" hidden>
+    <div class="ringlabel">Incoming call</div>
+    <div class="ringfrom" id="ringfrom">—</div>
+    <div class="ringbtns">
+      <button class="accept" id="accept">Accept</button>
+      <button class="decline" id="decline">Decline</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <label for="to">Number to call</label>
+    <input id="to" type="tel" placeholder="+919876543210" autocomplete="off">
+    <button class="call" id="call" disabled>Call</button>
+    <button class="hangup" id="hangup" hidden>Hang up</button>
+  </div>
+
+  <div class="card"><div class="log" id="log"></div></div>
+</div>
+
+<audio id="remote" autoplay></audio>
+<script src="jssip.min.js"></script>
+<script>
+/**
+ * Agent softphone for the Vobiz × Zoho PhoneBridge integration.
+ *
+ * The browser is the A leg: it places the INVITE itself and the backend answers
+ * with <Dial><Number> to reach the customer. The reverse — backend originates to
+ * the customer and bridges the browser in with <Dial><User> — is what the rest
+ * of this repository was built around, and it does not work: routing into a
+ * registered WebRTC endpoint is broken platform-side. See ISSUES.md.
+ *
+ * Zoho never opens this page itself. Zoho draws its own call bar and POSTs
+ * click-to-dial to the backend; the backend relays that here over the existing
+ * /call-events SSE stream, and this page does the dialling.
+ */
+const params = new URLSearchParams(location.search);
+const AGENT  = params.get("agentId") || "test-agent";
+
+// The backend is wherever THIS page was served from — directory included.
+// Using location.origin alone breaks the moment the backend sits behind a path
+// prefix (a tunnel fronting several services, say): the API calls lose the
+// prefix, land on whatever answers the bare path, and the first symptom is a
+// JSON parse error on some other service's response body.
+const HERE    = location.pathname.replace(/\/[^/]*$/, "");   // "/zoho" → "", "/zoho/agent-phone" → "/zoho"
+const BACKEND = (params.get("backend") || location.origin + HERE).replace(/\/+$/, "");
+
+const el = id => document.getElementById(id);
+const log = (msg, strong) => {
+  const t = new Date().toTimeString().slice(0, 8);
+  el("log").insertAdjacentHTML("afterbegin", `${t}  ${strong ? `<b>${msg}</b>` : msg}\n`);
+};
+const setStatus = (text, state) => {
+  el("status").textContent = text;
+  el("dot").className = "dot" + (state ? " " + state : "");
+};
+
+let ua = null, session = null, registered = false;
+
+const setRegistered = ok => {
+  registered = ok;
+  el("call").disabled = !ok;
+};
+
+const showInCall = live => {
+  el("hangup").hidden = !live;
+  el("call").hidden = live;
+};
+
+/** Bind the far-end audio. Must go through the "peerconnection" event: reading
+ *  session.connection too early throws, and a throw inside the event handler
+ *  aborts it before the call is ever set up. */
+function attachAudio(s) {
+  const bind = pc => pc && pc.addEventListener("track", e => {
+    el("remote").srcObject = e.streams[0];
+    el("remote").play().catch(() => log("autoplay blocked — click the page once"));
+  });
+  s.on("peerconnection", e => bind(e.peerconnection));
+  bind(s.connection);
+}
+
+async function start() {
+  let agent;
+  try {
+    const res = await fetch(`${BACKEND}/agent/${encodeURIComponent(AGENT)}`, {
+      headers: { "ngrok-skip-browser-warning": "1" },
+    });
+    if (!res.ok) throw new Error(`backend returned ${res.status}`);
+    agent = await res.json();
+  } catch (err) {
+    setStatus("Cannot reach the backend", "err");
+    log(`GET ${BACKEND}/agent/${AGENT} failed — ${err.message}`, true);
+    return;
+  }
+
+  el("who").textContent = `${agent.displayName || AGENT} · ${agent.sipUser}`;
+  setStatus("Connecting…");
+
+  ua = new JsSIP.UA({
+    sockets: [new JsSIP.WebSocketInterface("wss://registrar.vobiz.ai:5063/")],
+    uri: `sip:${agent.sipUser}`,
+    password: agent.sipPassword,
+    register: true,
+    // Vobiz's media server answers JsSIP's default session-timer proposal with
+    // "422 Session Interval Too Small". JsSIP reports that as the opaque cause
+    // "SIP Failure Code" and no CDR is written at all, because the call is
+    // refused before it is created. Vobiz's own SDK sets this same flag.
+    session_timers: false,
+    // No space: Vobiz interpolates the registration's User-Agent unescaped into
+    // a gateway URI. JsSIP's default is "JsSIP 3.10.1".
+    user_agent: "VobizZohoAgentPhone/1.0.0",
+  });
+
+  ua.on("connected",    () => log("websocket connected"));
+  ua.on("disconnected", () => { setStatus("Disconnected", "err"); setRegistered(false); });
+  ua.on("registered",   () => { setStatus(`Ready — ${agent.displayName || AGENT}`, "on"); setRegistered(true); log("registered", true); });
+  ua.on("unregistered", () => { setStatus("Not registered", "err"); setRegistered(false); });
+  ua.on("registrationFailed", e => {
+    setStatus(`Registration failed: ${(e && e.cause) || "unknown"}`, "err");
+    setRegistered(false);
+    log(`registration failed — ${(e && e.cause) || "unknown"}`, true);
+  });
+
+  // Inbound: a PSTN caller reached the DID and the backend bridged to <User>.
+  // Currently blocked platform-side, but the handler is correct for when it is not.
+  // Inbound calls ring and wait for the agent. The <Dial> on the backend gives
+  // them 20 seconds; after that VoBiz gives up and the caller hears voicemail.
+  ua.on("newRTCSession", ({ originator, session: s }) => {
+    if (originator !== "remote") return;
+    clearInboundWatch();
+
+    const caller = callerOf(s);
+    log(`incoming call from ${caller}`, true);
+    session = s;
+    setStatus(`Incoming from ${caller}`, "on");
+    showRinging(caller);
+    startRingback();
+
+    // The caller can give up, or VoBiz can time the leg out, while the banner is
+    // still on screen — clear it either way rather than leaving a dead Accept.
+    s.on("ended",  () => endRing(`caller hung up`));
+    s.on("failed", e => endRing(`call ended — ${(e && e.cause) || "cancelled"}`));
+  });
+
+  ua.start();
+  listenForClickToDial();
+}
+
+function dial(number) {
+  if (!registered) { log("not registered yet", true); return; }
+  const target = `sip:${String(number).replace(/[^\d+]/g, "")}@registrar.vobiz.ai`;
+  log(`dialling ${number}`, true);
+  setStatus(`Calling ${number}…`);
+
+  try {
+    session = ua.call(target, {
+      mediaConstraints: { audio: true, video: false },
+      // Without STUN the offer carries host-only candidates, Vobiz logs
+      // "PrivateIP … Detected in SDP", and the browser rejects the early-media
+      // answer as an incompatible SDP, cancelling a few hundred ms in.
+      pcConfig: { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] },
+      sessionTimersExpires: 300,
+    });
+  } catch (err) {
+    setStatus("Could not start the call", "err");
+    log(`call failed to start — ${err.message}`, true);
+    return;
+  }
+
+  attachAudio(session);
+  showInCall(true);
+  session.on("progress",  () => setStatus(`Ringing ${number}…`));
+  session.on("confirmed", () => { setStatus(`On a call with ${number}`, "on"); log("answered", true); });
+  session.on("failed",    e => {
+    setStatus(`Call failed — ${(e && e.cause) || "unknown"}`, "err");
+    log(`call failed — ${(e && e.cause) || "unknown"}`, true);
+    session = null; showInCall(false);
+  });
+  session.on("ended", () => {
+    setStatus(`Ready`, "on"); log("call ended", true);
+    session = null; showInCall(false);
+  });
+}
+
+/** Best effort at a human-readable caller from the SIP request. */
+function callerOf(s) {
+  try {
+    const uri = s.remote_identity && s.remote_identity.uri;
+    const user = uri && uri.user;
+    if (user) return user.startsWith("+") ? user : `+${user}`;
+    return (s.remote_identity && s.remote_identity.display_name) || "unknown";
+  } catch { return "unknown"; }
+}
+
+function showRinging(from) {
+  el("ringfrom").textContent = from;
+  el("ringing").hidden = false;
+}
+
+function endRing(reason) {
+  stopRingback();
+  el("ringing").hidden = true;
+  showInCall(false);
+  session = null;
+  if (reason) log(reason, true);
+  if (registered) setStatus("Ready", "on");
+}
+
+/** A ringtone, synthesised — no asset to ship or fail to load. */
+let ringCtx = null, ringTimer = null;
+function startRingback() {
+  stopRingback();
+  try {
+    ringCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const beep = () => {
+      if (!ringCtx) return;
+      const osc = ringCtx.createOscillator();
+      const gain = ringCtx.createGain();
+      osc.frequency.value = 440;
+      gain.gain.setValueAtTime(0.0001, ringCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.12, ringCtx.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ringCtx.currentTime + 0.9);
+      osc.connect(gain).connect(ringCtx.destination);
+      osc.start(); osc.stop(ringCtx.currentTime + 0.95);
+    };
+    beep();
+    ringTimer = setInterval(beep, 2400);
+  } catch { /* a silent ring is still a visible one */ }
+}
+function stopRingback() {
+  if (ringTimer) { clearInterval(ringTimer); ringTimer = null; }
+  if (ringCtx) { try { ringCtx.close(); } catch {} ringCtx = null; }
+}
+
+function acceptCall() {
+  if (!session) return;
+  stopRingback();
+  el("ringing").hidden = true;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("no microphone in this context");
+    attachAudio(session);
+    // Same pcConfig the outbound call needs, and for the same reason: without
+    // STUN the answer carries host-only candidates, VoBiz cannot negotiate
+    // against them, and the leg is torn down without connecting — the browser
+    // rings, the CDR shows a B leg billed 0s, and nothing says why. Vobiz's own
+    // SDK sets these on the incoming answer too.
+    session.answer({
+      mediaConstraints: { audio: true, video: false },
+      pcConfig: { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] },
+      sessionTimersExpires: 300,
+    });
+    showInCall(true);
+    setStatus("On a call", "on");
+    log("accepted", true);
+    session.on("confirmed", () => setStatus("On a call", "on"));
+  } catch (err) {
+    log(`could not answer — ${err.message}`, true);
+    try { session.terminate(); } catch {}
+    endRing();
+  }
+}
+
+function declineCall() {
+  if (!session) return;
+  log("declined", true);
+  try { session.terminate(); } catch {}
+  endRing();
+}
+
+/**
+ * The backend saw a PSTN call routed to this agent and said so. Whether VoBiz
+ * then actually rings this browser is the open question — <Dial><User> into a
+ * registered WebRTC endpoint is currently dropped platform-side, and when it is
+ * dropped *nothing at all* happens here: no ring, no error, no SIP event. That
+ * is indistinguishable from a broken panel unless somebody says otherwise.
+ *
+ * So: announce the call, then wait. A real INVITE clears this. Silence gets
+ * named for what it is.
+ */
+let inboundWatch = null;
+const INBOUND_GRACE_MS = 22000;   // the inbound XML dials <User> with timeout="20"
+
+function clearInboundWatch() {
+  if (inboundWatch) { clearTimeout(inboundWatch); inboundWatch = null; }
+}
+
+function watchForInbound(from, callUuid) {
+  clearInboundWatch();
+  log(`inbound call from ${from} routed to this agent — waiting for VoBiz to ring this browser`, true);
+  setStatus(`Incoming from ${from}…`);
+  inboundWatch = setTimeout(() => {
+    inboundWatch = null;
+    setStatus("VoBiz never rang this browser", "err");
+    log(`no INVITE arrived in ${INBOUND_GRACE_MS / 1000}s — the caller heard voicemail instead.`, true);
+    log(`this is the platform-side <Dial><User> defect, not a fault in this page${callUuid ? ` (CallUUID ${callUuid})` : ""}`);
+    setTimeout(() => { if (registered) setStatus("Ready", "on"); }, 6000);
+  }, INBOUND_GRACE_MS);
+}
+
+/** Zoho click-to-dial arrives at the backend, which relays it here. */
+function listenForClickToDial() {
+  const src = new EventSource(`${BACKEND}/call-events/${encodeURIComponent(AGENT)}`);
+  src.onopen = () => log("listening for Zoho click-to-dial");
+  src.onerror = () => log("click-to-dial stream dropped — retrying");
+  src.onmessage = e => {
+    let ev; try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.type === "dial" && ev.to) {
+      log(`Zoho asked for ${ev.to}`, true);
+      el("to").value = ev.to;
+      dial(ev.to);
+    }
+    if (ev.type === "inbound-routed") {
+      watchForInbound(ev.from, ev.callUuid);
+    }
+  };
+}
+
+el("call").addEventListener("click", () => dial(el("to").value.trim()));
+el("to").addEventListener("keydown", e => { if (e.key === "Enter") dial(el("to").value.trim()); });
+el("hangup").addEventListener("click", () => { try { session && session.terminate(); } catch {} });
+el("accept").addEventListener("click", acceptCall);
+el("decline").addEventListener("click", declineCall);
+// Enter accepts, Escape declines, while the banner is up.
+document.addEventListener("keydown", e => {
+  if (el("ringing").hidden) return;
+  if (e.key === "Enter")  { e.preventDefault(); acceptCall(); }
+  if (e.key === "Escape") { e.preventDefault(); declineCall(); }
+});
+window.addEventListener("beforeunload", () => { try { ua && ua.stop(); } catch {} });
+
+start();
+</script>
+</body>
+</html>

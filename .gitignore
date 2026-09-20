@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.local
+*.log
+.DS_Store
+.pipedrive-tokens.json
+zoho-orgs.json
+agents.json
+dist/
