@@ -55,8 +55,9 @@ call. Until then, anyone who can reach the webhook routes can send fake call
 events (they cannot place calls or read secrets through them).
 
 **Agent sessions cannot be revoked one at a time.** They expire after 12
-hours; rotating `APP_SECRET` ends all of them and invalidates every agent link
-and click-to-dial registration (re-run register).
+hours; rotating `APP_SECRET` ends all of them and invalidates every agent link,
+every click-to-dial registration (re-run register) and, unless
+`RECORDING_URL_SECRET` is set, every recording link already in Zoho.
 
 **Deployment secrets live in environment variables** (`APP_SECRET`,
 `TOKEN_ENCRYPTION_KEY`, `ADMIN_TOKEN`, the Zoho PhoneBridge client). Use your host's secret manager.
