@@ -5,7 +5,7 @@
  *
  * What shapes it:
  *
- *   - It is a PUBLIC integration. Any Zoho customer who installs VoBiz from
+ *   - It is a PUBLIC integration. Any Zoho customer who installs Vobiz from
  *     the Telephony Marketplace becomes a tenant here, so tokens are stored
  *     per-org, never globally.
  *   - Zoho runs ELEVEN datacentres (confirmed live against
@@ -447,7 +447,7 @@ async function unregisterClickToDial({ orgId, credentials, zohoUser }) {
 // Call correlation
 // ---------------------------------------------------------------------------
 //
-// Maps a VoBiz call to the Zoho org and call id it belongs to, so later
+// Maps a Vobiz call to the Zoho org and call id it belongs to, so later
 // webhooks (answer, dial-result, recording-ready) know who to report to.
 // In-memory: a restart loses in-flight calls, which for a call already in
 // progress only costs the final state update. Moves to the DB alongside the

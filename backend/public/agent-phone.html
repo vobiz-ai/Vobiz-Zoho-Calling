@@ -205,7 +205,7 @@ async function start() {
     showRinging(caller);
     startRingback();
 
-    // The caller can give up, or VoBiz can time the leg out, while the banner is
+    // The caller can give up, or Vobiz can time the leg out, while the banner is
     // still on screen — clear it either way rather than leaving a dead Accept.
     s.on("ended",  () => endRing(`caller hung up`));
     s.on("failed", e => endRing(`call ended — ${(e && e.cause) || "cancelled"}`));
@@ -309,7 +309,7 @@ function acceptCall() {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error("no microphone in this context");
     attachAudio(session);
     // Same pcConfig the outbound call needs, and for the same reason: without
-    // STUN the answer carries host-only candidates, VoBiz cannot negotiate
+    // STUN the answer carries host-only candidates, Vobiz cannot negotiate
     // against them, and the leg is torn down without connecting — the browser
     // rings, the CDR shows a B leg billed 0s, and nothing says why. Vobiz's own
     // SDK sets these on the incoming answer too.
@@ -337,7 +337,7 @@ function declineCall() {
 }
 
 /**
- * The backend saw a PSTN call routed to this agent and said so. Whether VoBiz
+ * The backend saw a PSTN call routed to this agent and said so. Whether Vobiz
  * then actually rings this browser is not guaranteed — when an INVITE to a
  * registered WebRTC endpoint is dropped, *nothing at all* happens here: no
  * ring, no error, no SIP event. That
@@ -355,11 +355,11 @@ function clearInboundWatch() {
 
 function watchForInbound(from, callUuid) {
   clearInboundWatch();
-  log(`inbound call from ${from} routed to this agent — waiting for VoBiz to ring this browser`, true);
+  log(`inbound call from ${from} routed to this agent — waiting for Vobiz to ring this browser`, true);
   setStatus(`Incoming from ${from}…`);
   inboundWatch = setTimeout(() => {
     inboundWatch = null;
-    setStatus("VoBiz never rang this browser", "err");
+    setStatus("Vobiz never rang this browser", "err");
     log(`no INVITE arrived in ${INBOUND_GRACE_MS / 1000}s — the caller heard voicemail instead.`, true);
     log(`Vobiz did not deliver the call to this browser${callUuid ? ` (CallUUID ${callUuid})` : ""} — reload this page to re-register, then try again`);
     setTimeout(() => { if (registered) setStatus("Ready", "on"); }, 6000);
