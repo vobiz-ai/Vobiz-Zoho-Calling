@@ -2,7 +2,7 @@
   "name": "vobiz-zoho-phonebridge",
   "version": "1.0.0",
   "private": true,
-  "description": "VoBiz calling backend with the Zoho PhoneBridge V3 integration",
+  "description": "Vobiz calling backend with the Zoho PhoneBridge V3 integration",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
