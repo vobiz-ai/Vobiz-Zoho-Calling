@@ -19,14 +19,19 @@
   .status { font-weight:600; }
   .sub { color:var(--dim); font-size:12px; margin-top:3px; word-break:break-all; }
   label { display:block; font-size:11px; letter-spacing:.09em; text-transform:uppercase; color:var(--dim); margin:14px 0 5px; }
-  input { width:100%; padding:11px 12px; background:#171311; border:1px solid var(--line);
+  input, select { width:100%; padding:11px 12px; background:#171311; border:1px solid var(--line);
           border-radius:7px; color:var(--ink); font-size:15px; font-family:inherit; }
-  input:focus { outline:none; border-color:var(--brand); }
+  input:focus, select:focus { outline:none; border-color:var(--brand); }
   button { width:100%; padding:12px; border:0; border-radius:7px; font-size:15px; font-weight:600;
            font-family:inherit; cursor:pointer; margin-top:10px; }
   .call { background:var(--brand); color:#fff; }
   .call:disabled { background:#3a302b; color:#6d625b; cursor:not-allowed; }
   .hangup { background:var(--bad); color:#fff; }
+  .secondary { background:#3a302b; color:var(--ink); }
+  .note { color:var(--dim); font-size:12px; margin-top:8px; }
+  .modes { display:flex; gap:8px; margin-top:12px; }
+  .modes button { margin:0; padding:9px; font-size:13px; background:#3a302b; color:var(--dim); }
+  .modes button[aria-pressed="true"] { background:var(--brand); color:#fff; }
   .ring { border-color:var(--brand); animation:pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { border-color:#4a3a33; } 50% { border-color:var(--brand); } }
   @media (prefers-reduced-motion:reduce) { .ring { animation:none; border-color:var(--brand); } }
@@ -50,6 +55,42 @@
     <div class="sub" id="who"></div>
   </div>
 
+  <form class="card" id="vobizLogin" hidden autocomplete="off">
+    <div class="status">Sign in to Vobiz</div>
+    <div class="modes" role="group" aria-label="Sign-in mode">
+      <button type="button" id="modeAccount" aria-pressed="true">Vobiz account</button>
+      <button type="button" id="modeSip" aria-pressed="false">SIP direct</button>
+    </div>
+    <div id="accountFields">
+      <div class="note">Your Vobiz Auth ID and Auth Token (Vobiz console, Account). The backend sets up your SIP line; the token stays in its memory and is never shown again.</div>
+      <label for="authId">Auth ID</label>
+      <input id="authId" autocomplete="off" spellcheck="false">
+      <label for="authToken">Auth Token</label>
+      <input id="authToken" type="password" autocomplete="off">
+    </div>
+    <div id="sipFields" hidden>
+      <div class="note">An endpoint you already have. Its application's answer URL must be this backend's /answer. The SIP password stays in this browser.</div>
+      <label for="sipUser">SIP username</label>
+      <input id="sipUser" autocomplete="off" spellcheck="false">
+      <label for="sipPassword">SIP password</label>
+      <input id="sipPassword" type="password" autocomplete="off">
+      <label for="sipCallerId">Caller ID (a number on your Vobiz account)</label>
+      <input id="sipCallerId" type="tel" autocomplete="off" placeholder="E.164, with country code">
+    </div>
+    <button class="call" id="vobizSignIn" type="submit">Sign in</button>
+  </form>
+
+  <div class="card" id="lineCard" hidden>
+    <div id="accountOnly">
+      <label for="callerId">Caller ID</label>
+      <select id="callerId"></select>
+      <button class="secondary" id="enableInbound" type="button">Enable inbound calls on this number</button>
+      <div class="note">Points this number's incoming calls at this integration, replacing whatever application answered it before.</div>
+    </div>
+    <div class="note" id="sipOnly" hidden>Signed in SIP direct. Caller ID choice, "Enable inbound calls" and recordings in Zoho: sign in with your Vobiz account to use this.</div>
+    <button class="secondary" id="vobizSignOut" type="button">Sign out of Vobiz</button>
+  </div>
+
   <div class="card ring" id="ringing" hidden>
     <div class="ringlabel">Incoming call</div>
     <div class="ringfrom" id="ringfrom">—</div>
@@ -61,7 +102,7 @@
 
   <div class="card">
     <label for="to">Number to call</label>
-    <input id="to" type="tel" placeholder="+919876543210" autocomplete="off">
+    <input id="to" type="tel" placeholder="Number in E.164, with country code" autocomplete="off">
     <button class="call" id="call" disabled>Call</button>
     <button class="hangup" id="hangup" hidden>Hang up</button>
   </div>
@@ -142,8 +183,15 @@ async function signInFromFragment() {
   if (!res.ok) log("that sign-in link was not accepted — ask your admin for a new one", true);
 }
 
+let agent = null;
+
+const postJson = (p, body) => fetch(`${BACKEND}${p}`, {
+  method: "POST", credentials: "same-origin",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body || {}),
+});
+
 async function start() {
-  let agent;
   try {
     await signInFromFragment();
     const res = await fetch(`${BACKEND}/agent/me`, {
@@ -163,13 +211,145 @@ async function start() {
     log(`GET ${BACKEND}/agent/me failed — ${err.message}`, true);
     return;
   }
-  el("who").textContent = `${agent.displayName || AGENT} · ${agent.sipUser}`;
+  el("who").textContent = agent.displayName || AGENT;
+  // The SIP password is handed out once per Vobiz sign-in and kept only in
+  // this page's memory, so every page load signs in to Vobiz again.
+  if (agent.vobiz && agent.vobiz.authId) el("authId").value = agent.vobiz.authId;
+  if (agent.vobiz && agent.vobiz.mode === "sip") setMode("sip");
+  showVobizLogin(true);
+  setStatus("Sign in to Vobiz to start");
+}
+
+function showVobizLogin(on) {
+  el("vobizLogin").hidden = !on;
+  el("lineCard").hidden = on;
+}
+
+let mode = "account";
+// Sent as X-VH-Caller-ID on every INVITE; the backend also keeps it per SIP user.
+let currentCallerId = null;
+function setMode(next) {
+  mode = next;
+  el("modeAccount").setAttribute("aria-pressed", String(next === "account"));
+  el("modeSip").setAttribute("aria-pressed", String(next === "sip"));
+  el("accountFields").hidden = next !== "account";
+  el("sipFields").hidden = next !== "sip";
+}
+
+function showLineCard(signedInMode) {
+  el("accountOnly").hidden = signedInMode !== "account";
+  el("sipOnly").hidden = signedInMode !== "sip";
+}
+
+async function signInSipDirect() {
+  const sipUser = el("sipUser").value.trim();
+  const sipPassword = el("sipPassword").value;
+  const callerId = el("sipCallerId").value.trim();
+  if (!sipUser || !sipPassword || !callerId) { log("enter the SIP username, password and caller ID", true); return; }
+  el("vobizSignIn").disabled = true;
+  try {
+    // Only the username and caller ID go to the backend.
+    const res = await postJson("/agent/sip-session", { sipUser, callerId });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) { setStatus("SIP sign-in refused", "err"); log(out.error || `sign-in failed (${res.status})`, true); return; }
+    el("sipPassword").value = "";
+    currentCallerId = out.callerId;
+    showVobizLogin(false);
+    showLineCard("sip");
+    el("who").textContent = `${agent.displayName || AGENT} · SIP direct · ${out.sipUser} · ${out.callerId}`;
+    startPhone(out.sipUser, sipPassword);
+  } catch (err) {
+    setStatus("Cannot reach the backend", "err");
+    log(`SIP sign-in failed — ${err.message}`, true);
+  } finally {
+    el("vobizSignIn").disabled = false;
+  }
+}
+
+async function signInToVobiz(e) {
+  e.preventDefault();
+  if (mode === "sip") return signInSipDirect();
+  const authId = el("authId").value.trim();
+  const authToken = el("authToken").value.trim();
+  if (!authId || !authToken) return;
+  el("vobizSignIn").disabled = true;
+  setStatus("Checking your Vobiz account…");
+  try {
+    const res = await postJson("/agent/vobiz-session", { authId, authToken });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setStatus(res.status === 401 ? "Vobiz did not accept those credentials" : "Vobiz sign-in failed", "err");
+      log(out.error || `sign-in failed (${res.status})`, true);
+      return;
+    }
+    el("authToken").value = "";
+    fillNumbers(out.numbers || [], out.callerId);
+    currentCallerId = out.callerId;
+    showVobizLogin(false);
+    showLineCard("account");
+    el("who").textContent = `${agent.displayName || AGENT} · ${out.authId} · ${out.sipUser}`;
+    if (out.applicationBound === false) log("the SIP endpoint could not be bound to the application — outbound calls may not connect", true);
+    startPhone(out.sipUser, out.sipPassword);
+  } catch (err) {
+    setStatus("Cannot reach the backend", "err");
+    log(`Vobiz sign-in failed — ${err.message}`, true);
+  } finally {
+    el("vobizSignIn").disabled = false;
+  }
+}
+
+// Active, voice-enabled numbers from List Account Phone Numbers, with the
+// application each one answers on today. No free-text caller ID in this mode.
+let numberInfo = [];
+function fillNumbers(numbers, selected) {
+  numberInfo = numbers;
+  const sel = el("callerId");
+  sel.replaceChildren(...numbers.map(n => {
+    const o = document.createElement("option");
+    o.value = n.e164;
+    o.textContent = n.ours ? `${n.e164} · inbound on` : n.e164;
+    o.selected = n.e164 === selected;
+    return o;
+  }));
+  el("enableInbound").disabled = numbers.length === 0;
+  if (!numbers.length) log("this Vobiz account has no numbers — outbound calls need one as caller ID", true);
+}
+
+async function changeCallerId() {
+  const res = await postJson("/agent/caller-id", { callerId: el("callerId").value });
+  if (res.ok) currentCallerId = el("callerId").value;
+  log(res.ok ? `caller ID set to ${el("callerId").value}` : "could not change the caller ID", !res.ok);
+}
+
+async function enableInbound() {
+  const number = el("callerId").value;
+  if (!number) return;
+  const info = numberInfo.find(n => n.e164 === number) || {};
+  if (info.ours) { log(`${number} already rings this integration`, true); return; }
+  const from = info.applicationId ? `application ${info.applicationId}` : "no application";
+  if (!confirm(`Route incoming calls on ${number} to this integration? It moves off ${from}.`)) return;
+  const res = await postJson("/agent/enable-inbound", { number });
+  const out = await res.json().catch(() => ({}));
+  if (res.ok) { info.ours = true; info.applicationId = out.applicationId; fillNumbers(numberInfo, number); }
+  log(res.ok ? `inbound calls on ${out.number} now ring signed-in agents (moved off ${out.previousApplicationId || "no application"})` : (out.error || "could not enable inbound calls"), true);
+}
+
+async function signOutOfVobiz() {
+  try { ua && ua.stop(); } catch {}
+  ua = null;
+  setRegistered(false);
+  await postJson("/agent/vobiz-logout").catch(() => {});
+  showVobizLogin(true);
+  setStatus("Signed out of Vobiz");
+}
+
+function startPhone(sipUser, sipPassword) {
   setStatus("Connecting…");
 
   ua = new JsSIP.UA({
     sockets: [new JsSIP.WebSocketInterface("wss://registrar.vobiz.ai:5063/")],
-    uri: `sip:${agent.sipUser}`,
-    password: agent.sipPassword,
+    uri: `sip:${sipUser}`,
+    password: sipPassword,
     register: true,
     // Vobiz's media server answers JsSIP's default session-timer proposal with
     // "422 Session Interval Too Small". JsSIP reports that as the opaque cause
@@ -212,7 +392,7 @@ async function start() {
   });
 
   ua.start();
-  listenForClickToDial();
+  if (!clickToDialSource) listenForClickToDial();
 }
 
 function dial(number) {
@@ -229,6 +409,8 @@ function dial(number) {
       // answer as an incompatible SDP, cancelling a few hundred ms in.
       pcConfig: { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] },
       sessionTimersExpires: 300,
+      // Vobiz hands X-VH-* headers to the answer URL as webhook parameters.
+      extraHeaders: currentCallerId ? [`X-VH-Caller-ID: ${currentCallerId}`] : [],
     });
   } catch (err) {
     setStatus("Could not start the call", "err");
@@ -367,8 +549,9 @@ function watchForInbound(from, callUuid) {
 }
 
 /** Zoho click-to-dial arrives at the backend, which relays it here. */
+let clickToDialSource = null;
 function listenForClickToDial() {
-  const src = new EventSource(`${BACKEND}/call-events`, { withCredentials: true });
+  const src = clickToDialSource = new EventSource(`${BACKEND}/call-events`, { withCredentials: true });
   src.onopen = () => log("listening for Zoho click-to-dial");
   src.onerror = () => log("click-to-dial stream dropped — retrying");
   src.onmessage = e => {
@@ -384,6 +567,12 @@ function listenForClickToDial() {
   };
 }
 
+el("vobizLogin").addEventListener("submit", signInToVobiz);
+el("modeAccount").addEventListener("click", () => setMode("account"));
+el("modeSip").addEventListener("click", () => setMode("sip"));
+el("callerId").addEventListener("change", changeCallerId);
+el("enableInbound").addEventListener("click", enableInbound);
+el("vobizSignOut").addEventListener("click", signOutOfVobiz);
 el("call").addEventListener("click", () => dial(el("to").value.trim()));
 el("to").addEventListener("keydown", e => { if (e.key === "Enter") dial(el("to").value.trim()); });
 el("hangup").addEventListener("click", () => { try { session && session.terminate(); } catch {} });

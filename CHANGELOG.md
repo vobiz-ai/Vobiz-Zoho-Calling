@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Any Vobiz account can sign in
+
+- Agents sign in to Vobiz from the softphone, with their own Auth ID + Auth
+  Token ("Vobiz account") or an existing endpoint's SIP login + caller ID
+  ("SIP direct"). `VOBIZ_AUTH_ID`, `VOBIZ_AUTH_TOKEN` and `VOBIZ_FROM_NUMBER`
+  are gone, and `agents.json` holds only the agent ↔ Zoho user mapping.
+- In "Vobiz account" mode the backend finds or creates this integration's
+  application and one SIP endpoint per agent in that account, rotates the SIP
+  password on each sign-in, and keeps the token in memory only.
+- Caller ID is picked from the account's active, voice-enabled numbers; the
+  backend refuses anything else. Also sent as `X-VH-Caller-ID`.
+- "Enable inbound calls" attaches a number to the provisioned application.
+  `/inbound-answer?agentId=` and its hand-made application are no longer
+  needed; inbound is routed by `ParentAuthID` / the dialled DID.
+- Webhook signatures, CDR lookups and recordings use the right account's
+  token; recording links carry the Auth ID inside their signature.
+- Removed: `CLICKTODIAL_WHEN_OFFLINE=phone` (it needed server-side Vobiz
+  credentials and a phone number per agent).
+
 ### Security
 
 - `GET /agent/:id` no longer returns a SIP password unauthenticated. Agents
