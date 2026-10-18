@@ -1,16 +1,11 @@
 {
   "priya": {
     "displayName": "Priya",
-    "sipUser": "priya123@registrar.vobiz.ai",
-    "sipPassword": "the-endpoint-password-from-the-vobiz-console",
-    "callerId": "+91XXXXXXXXXX",
-    "zohoUser": "60083148163",
+    "zohoUser": "600001",
     "email": "priya@example.com"
   },
   "arjun": {
     "displayName": "Arjun",
-    "sipUser": "arjun456@registrar.vobiz.ai",
-    "sipPassword": "the-endpoint-password-from-the-vobiz-console",
     "email": "arjun@example.com"
   }
 }

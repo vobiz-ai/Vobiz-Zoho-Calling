@@ -10,3 +10,4 @@ dist/
 data/
 *.tmp
 package-lock.json
+vobiz-endpoints.json

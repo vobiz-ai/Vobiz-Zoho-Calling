@@ -6,7 +6,8 @@
  *   node test-zoho-phonebridge.js
  *
  * Hermetic: a mock Zoho (OAuth + PhoneBridge V3) runs on localhost, Vobiz's
- * REST API and Zoho's serverinfo directory are stubbed, and every file the
+ * REST API (two fake accounts, MA_TEST0001 and MA_TEST0002) and Zoho's
+ * serverinfo directory are stubbed, and every file the
  * backend writes goes to a throwaway directory. Nothing touches the network,
  * a real Zoho org or a real Vobiz account.
  *
@@ -42,20 +43,17 @@ Object.assign(process.env, {
   ADMIN_TOKEN: "test-admin-token-123",
   ALLOWED_ORIGINS: "https://crm.zoho.in",
   PUBLIC_BASE_URL: "https://example.test",
-  VOBIZ_AUTH_ID: "MA_TESTACCOUNT",
-  VOBIZ_AUTH_TOKEN: "test-auth-token",
-  VOBIZ_FROM_NUMBER: "+911111111111",
   ZOHO_PB_CLIENT_ID: "1000.TESTCLIENT",
   ZOHO_PB_CLIENT_SECRET: "test-client-secret",
   ZOHO_PB_REDIRECT_URI: "https://example.test/oauth/zoho/callback",
   ZOHO_PB_RECORDING_GRACE_MS: "60000",
 });
-for (const k of ["REQUIRE_VOBIZ_SIGNATURE", "CLICKTODIAL_WHEN_OFFLINE", "ZOHO_PB_SEND_MISSED_STATE", "RECORDING_URL_SECRET"]) delete process.env[k];
+for (const k of ["VOBIZ_AUTH_ID", "VOBIZ_AUTH_TOKEN", "VOBIZ_FROM_NUMBER", "REQUIRE_VOBIZ_SIGNATURE", "CLICKTODIAL_WHEN_OFFLINE", "ZOHO_PB_SEND_MISSED_STATE", "RECORDING_URL_SECRET"]) delete process.env[k];
 
 fs.writeFileSync(AGENTS_FILE, JSON.stringify({
-  priya: { displayName: "Priya", sipUser: "priya123@registrar.vobiz.ai", sipPassword: "priya-sip-secret", zohoUser: "600001", callerId: "+912222222222" },
-  arjun: { displayName: "Arjun", sipUser: "arjun456@registrar.vobiz.ai", sipPassword: "arjun-sip-secret", email: "Arjun@Example.com" },
-  nomatch: { displayName: "Unmapped", sipUser: "zzz@registrar.vobiz.ai", sipPassword: "x" },
+  priya: { displayName: "Priya", zohoUser: "600001" },
+  arjun: { displayName: "Arjun", email: "Arjun@Example.com" },
+  nomatch: { displayName: "Unmapped" },
 }, null, 2));
 
 let pass = 0;
@@ -130,35 +128,137 @@ function startMockZoho() {
 const realFetch = globalThis.fetch;
 let vobizCalls = [];
 let recordingUrlForStub = "https://media.vobiz.ai/recordings/rec-1.mp3";
+
+// Two fake Vobiz accounts. App ids are 17 digits and the mock writes them as
+// bare JSON integers, the way a naive JSON.parse would silently round.
+const OUR_APP_1 = "43919358318796814";
+const NEW_APP_2 = "53919358318796815";
+const TOKENS = { MA_TEST0001: "tok-one-secret-value", MA_TEST0002: "tok-two-secret-value" };
+const vobizState = {
+  MA_TEST0001: {
+    numbers: ["+910000000001", "+910000000002"],
+    apps: [
+      { app_id: "11111111111111111", app_name: "someone-elses", answer_url: "https://other.example/answer" },
+      { app_id: OUR_APP_1, app_name: "Vobiz-Zoho-PhoneBridge", answer_url: "https://example.test/answer" },
+    ],
+    endpoints: {},
+  },
+  MA_TEST0002: { numbers: ["+910000000003"], apps: [], endpoints: {} },
+};
+let endpointSeq = 9000;
+const bareIds = text => text.replace(/"app_id":"(\d{16,})"/g, '"app_id":$1');
+const vjson = (status, obj) => new Response(bareIds(JSON.stringify(obj)), { status, headers: { "Content-Type": "application/json" } });
+
+function vobizMock(target, init) {
+  const method = (init.method || "GET").toUpperCase();
+  const h = init.headers || {};
+  const body = String(init.body || "");
+  vobizCalls.push({ target, method, headers: h, body });
+  const u = new URL(target);
+  const m = u.pathname.match(/^\/api\/v1\/Account\/([^/]+)(\/.*)$/);
+  if (!m) return vjson(404, { error: "not found" });
+  const authId = decodeURIComponent(m[1]);
+  const rest = m[2];
+  const acct = vobizState[authId];
+  if (!acct || h["X-Auth-ID"] !== authId || h["X-Auth-Token"] !== TOKENS[authId]) return vjson(401, { error: "invalid credentials" });
+
+  if (method === "GET" && rest === "/numbers") {
+    // Two pages for MA_TEST0001 (per_page honoured as 1 there), plus a
+    // released and a voice-disabled number that must never be offered.
+    const all = acct.numbers.map(n => ({ id: `id-${n}`, account_id: authId, e164: n, status: "active", voice_enabled: true, application_id: OUR_APP_1 }))
+      .concat(authId === "MA_TEST0001" ? [
+        { id: "x1", e164: "+910000000098", status: "released", voice_enabled: true },
+        { id: "x2", e164: "+910000000099", status: "active", voice_enabled: false },
+      ] : []);
+    const per = authId === "MA_TEST0001" ? 2 : 100;
+    const page = Number(u.searchParams.get("page") || 1);
+    return vjson(200, { items: all.slice((page - 1) * per, page * per), page, per_page: per, total: all.length });
+  }
+  if (method === "GET" && rest === "/Application/") {
+    return vjson(200, { meta: { limit: 100, offset: 0, next: null, total_count: acct.apps.length }, objects: acct.apps });
+  }
+  if (method === "POST" && rest === "/Application/") {
+    const b = JSON.parse(body);
+    acct.apps.push({ app_id: NEW_APP_2, app_name: b.app_name, answer_url: b.answer_url, hangup_url: b.hangup_url });
+    return vjson(201, { api_id: "x", app_id: NEW_APP_2, message: "created" });
+  }
+  if (method === "GET" && rest === "/Endpoint/") {
+    const objects = Object.values(acct.endpoints).map(e => ({ endpoint_id: e.endpoint_id, username: e.username, alias: e.alias }));
+    return vjson(200, { meta: { limit: 100, offset: 0, next: null, total_count: objects.length }, objects });
+  }
+  if (method === "POST" && rest === "/Endpoint/") {
+    const b = JSON.parse(body);
+    if (!/^[A-Za-z0-9]+$/.test(b.username)) return vjson(400, { error: "invalid request parameters" });
+    const id = String(endpointSeq++);
+    // Vobiz rewrites the submitted username; the stored one differs.
+    acct.endpoints[id] = { endpoint_id: id, username: `${b.username}${id}`, alias: b.alias, password: b.password, app: null };
+    return vjson(201, { message: "created", endpoint_id: id, username: b.username });
+  }
+  let em = rest.match(/^\/Endpoint\/(\d+)\/$/);
+  if (em) {
+    const ep = acct.endpoints[em[1]];
+    if (!ep) return new Response("", { status: 404 });
+    if (method === "GET") {
+      return vjson(200, { endpoint_id: ep.endpoint_id, username: ep.username, alias: ep.alias, application: ep.app ? { app_id: ep.app } : null });
+    }
+    // MA_TEST0001 behaves as documented ("application", integer) and ignores
+    // "app_id"; MA_TEST0002 takes "app_id" as a string, as the playground sends.
+    const appMatch = body.match(/^\{"application":(\d+)\}$/);
+    const appIdMatch = body.match(/^\{"app_id":"(\d+)"\}$/);
+    if (appMatch) {
+      if (acct.apps.some(a => a.app_id === appMatch[1])) ep.app = appMatch[1];
+      else return vjson(400, { error: "unknown app_id" });
+    } else if (appIdMatch) {
+      if (authId === "MA_TEST0002" && acct.apps.some(a => a.app_id === appIdMatch[1])) ep.app = appIdMatch[1];
+    } else {
+      const b = JSON.parse(body);
+      if (b.password) ep.password = b.password;
+    }
+    return new Response("", { status: 202 });
+  }
+  em = rest.match(/^\/numbers\/%2B(\d+)\/application$/);
+  if (em && method === "POST") {
+    if (!acct.numbers.includes(`+${em[1]}`)) return vjson(404, { error: "not found" });
+    return vjson(200, { message: "Number attached to application", number: `+${em[1]}` });
+  }
+  if (method === "GET" && /^\/Recording\/[^/]+\/$/.test(rest)) {
+    return vjson(200, { recording_url: recordingUrlForStub, recording_format: "mp3" });
+  }
+  if (method === "GET" && /^\/Call\/([^/]+)\/$/.test(rest)) {
+    const id = rest.match(/^\/Call\/([^/]+)\/$/)[1];
+    return vjson(200, { bill_duration: id.startsWith("bleg") ? 37 : 99 });
+  }
+  return vjson(404, { error: "not found" });
+}
+
 globalThis.fetch = async (input, init = {}) => {
   const target = typeof input === "string" ? input : input.url;
   if (target === "https://accounts.zoho.com/oauth/serverinfo") {
     return new Response(JSON.stringify({ locations: { us: "https://accounts.zoho.com", in: "https://accounts.zoho.in", test: MOCK } }), { status: 200 });
   }
   if (target.startsWith("https://media.vobiz.ai/")) {
+    vobizCalls.push({ target, method: "GET", headers: init.headers || {}, body: "" });
     return new Response("ID3-fake-mp3", { status: 200, headers: { "Content-Type": "audio/mpeg" } });
   }
-  if (target.includes("api.vobiz.ai")) {
-    const method = (init.method || "GET").toUpperCase();
-    vobizCalls.push({ target, method, headers: init.headers, body: String(init.body || "") });
-    if (method === "GET" && /\/Recording\/[^/]+\/$/.test(target)) {
-      return new Response(JSON.stringify({ recording_url: recordingUrlForStub, recording_format: "mp3" }), { status: 200 });
-    }
-    if (method === "GET" && /\/Call\/([^/]+)\/$/.test(target)) {
-      const id = target.match(/\/Call\/([^/]+)\/$/)[1];
-      return new Response(JSON.stringify({ bill_duration: id.startsWith("bleg") ? 37 : 99 }), { status: 200 });
-    }
-    return new Response(JSON.stringify({ message: "Call fired", request_uuid: "mock-request-uuid" }), { status: 200 });
-  }
+  if (target.startsWith("https://api.vobiz.ai/")) return vobizMock(target, init);
   return realFetch(input, init);
 };
 
 const pb = require("./zoho-phonebridge");
 const { createTokenStore } = require("./token-store");
+const vobizAccounts = require("./vobiz-accounts");
 const { server, auth, finalizeZohoPhoneBridgeCall, verifyVobizSignature } = require("./server");
 let B = "";
 
-const req = (p, opts = {}) => realFetch(`${B}${p}`, { redirect: "manual", ...opts });
+// Every response this backend sends through req() is kept, so the suite can
+// prove an Auth Token never leaves the server.
+const seenResponses = [];
+const req = async (p, opts = {}) => {
+  const r = await realFetch(`${B}${p}`, { redirect: "manual", ...opts });
+  const text = await r.clone().text().catch(() => "");
+  seenResponses.push(`${p}\n${JSON.stringify([...r.headers])}\n${text}`);
+  return r;
+};
 const form = obj => ({ "Content-Type": "application/x-www-form-urlencoded", body: new URLSearchParams(obj).toString() });
 const post = (p, obj, headers = {}) => req(p, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", ...headers }, body: new URLSearchParams(obj).toString() });
 const postJson = (p, obj, headers = {}) => req(p, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(obj) });
@@ -247,7 +347,7 @@ async function testRouteAuth() {
   check("the right key issues an HttpOnly SameSite cookie", r.status === 200 && /HttpOnly/.test(r.headers.get("set-cookie")) && /SameSite=Strict/.test(r.headers.get("set-cookie")));
   r = await req("/agent/me", { headers: { Cookie: cookie } });
   body = await r.json();
-  check("the signed-in agent reads its own SIP credentials", r.status === 200 && body.sipPassword === "priya-sip-secret" && body.agentId === "priya", body);
+  check("the signed-in agent reads who they are — and no SIP password", r.status === 200 && body.agentId === "priya" && !("sipPassword" in body) && body.vobiz === null, body);
   r = await req("/agent/arjun", { headers: { Cookie: cookie } });
   check("and cannot read another agent's", r.status === 403, r.status);
   const forged = cookie.replace(/=(.)/, "=X");
@@ -327,19 +427,34 @@ async function testRegistration(orgId) {
   return Object.fromEntries(regs.map(x => [x.fields.zohouser, x.fields.clicktodialuri.replace("https://example.test", "")]));
 }
 
-function openSoftphone(agentId) {
-  return new Promise(async resolve => {
-    const s = await postJson("/agent-session", { agentId, key: auth.agentKey(agentId) });
-    const cookie = (s.headers.get("set-cookie") || "").split(";")[0];
+async function agentCookie(agentId) {
+  const s = await postJson("/agent-session", { agentId, key: auth.agentKey(agentId) });
+  return (s.headers.get("set-cookie") || "").split(";")[0];
+}
+
+/** Signs the agent in (link, then Vobiz account or SIP direct) and opens the event stream. */
+async function openSoftphone(agentId, creds) {
+  const cookie = await agentCookie(agentId);
+  const route = creds.sipUser ? "/agent/sip-session" : "/agent/vobiz-session";
+  const signin = await postJson(route, creds, { Cookie: cookie });
+  const vobiz = await signin.json();
+  return new Promise(resolve => {
     const events = [];
     const r = http.get(`${B}/call-events`, { headers: { Cookie: cookie } }, res => {
       res.on("data", chunk => {
         for (const line of String(chunk).split("\n")) if (line.startsWith("data: ")) events.push(JSON.parse(line.slice(6)));
       });
-      resolve({ events, close: () => r.destroy() });
+      resolve({ events, cookie, vobiz, status: signin.status, close: () => r.destroy() });
     });
   });
 }
+
+const ACCT1 = { authId: "MA_TEST0001", authToken: "tok-one-secret-value" };
+const ACCT2 = { authId: "MA_TEST0002", authToken: "tok-two-secret-value" };
+const sipUserOf = phone => phone.vobiz.sipUser.split("@")[0];
+let priyaPhone = null;
+let arjunPhone = null;
+let recordingLink = null;
 
 async function testClickToDial(orgId, uris) {
   console.log("\n[6] Click-to-dial → browser A leg → customer → call log");
@@ -353,7 +468,13 @@ async function testClickToDial(orgId, uris) {
   const err = received.find(x => x.path === "/phonebridge/v3/clicktodialerror");
   check("and Zoho is told why (clicktodialerror AGENT_OFFLINE)", err && err.fields.code === "AGENT_OFFLINE", err && err.fields);
 
-  const phone = await openSoftphone("priya");
+  const phone = priyaPhone = await openSoftphone("priya", { ...ACCT1, callerId: "+910000000002" });
+  check("priya signs in with Vobiz account MA_TEST0001", phone.status === 200 && phone.vobiz.authId === "MA_TEST0001" && Boolean(phone.vobiz.sipPassword), phone.vobiz);
+  check("the caller ID list is every page of active, voice-enabled numbers", JSON.stringify(phone.vobiz.numbers.map(n => n.e164)) === JSON.stringify(["+910000000001", "+910000000002"]), phone.vobiz.numbers);
+  check("each number says which application answers it", phone.vobiz.numbers.every(n => n.applicationId === OUR_APP_1));
+  r = await postJson("/agent/caller-id", { callerId: "+910000000099" }, { Cookie: phone.cookie });
+  check("a caller ID outside the account's list is rejected", r.status === 400);
+  vobizCalls = [];
   await tick();
   received.length = 0;
   r = await post(uris["600001"], { tonumber: "+919999900001", zohouser: "600001" });
@@ -365,40 +486,42 @@ async function testClickToDial(orgId, uris) {
   await waitFor(() => notifies().length >= 1);
   const ringing = notifies()[0];
   check("Zoho hears ringing for that user, without start_time", ringing && ringing.fields.state === "ringing" && ringing.fields.zohouser === "600001" && !("start_time" in ringing.fields), ringing && ringing.fields);
-  check("the caller ID is the agent's own", ringing && ringing.fields.from === "+912222222222");
+  check("the caller ID is the number the agent picked on their account", ringing && ringing.fields.from === "+910000000002", ringing && ringing.fields);
 
   // The browser's INVITE reaches Vobiz, which fetches the endpoint's answer URL.
   // No ?agentId= — the agent is recognised from the SIP username.
   const callUuid = "aleg-uuid-1";
-  r = await post("/answer", { CallUUID: callUuid, From: "sip:priya123@registrar.vobiz.ai", To: "919999900001", Direction: "inbound" });
+  r = await post("/answer", { CallUUID: callUuid, From: `sip:${sipUserOf(phone)}@registrar.vobiz.ai`, To: "919999900001", Direction: "inbound" });
   const xml = await r.text();
   check("/answer dials the customer with <Dial><Number>", /<Dial[^>]*>\s*<Number>919999900001<\/Number>/.test(xml), xml);
-  check("with the agent's caller ID", xml.includes('callerId="+912222222222"'));
+  check("with the agent's caller ID", xml.includes('callerId="+910000000002"'), xml);
   check("never with <Dial><User>", !xml.includes("<User>"));
-  check("and a callbackUrl to see the customer answer", xml.includes("/dial-event?agentId=priya"));
+  check("and a callbackUrl to see the customer answer, naming the account", xml.includes("/dial-event?agentId=priya&authId=MA_TEST0001"), xml);
 
   received.length = 0;
-  await post("/dial-event?agentId=priya", { Event: "DialAnswer", DialAction: "answer", CallUUID: callUuid, DialBLegUUID: "bleg-uuid-1" });
-  await post("/dial-event?agentId=priya", { Event: "DialAnswer", DialAction: "answer", CallUUID: callUuid, DialBLegUUID: "bleg-uuid-1" });
+  await post("/dial-event?agentId=priya&authId=MA_TEST0001", { Event: "DialAnswer", DialAction: "answer", CallUUID: callUuid, DialBLegUUID: "bleg-uuid-1" });
+  await post("/dial-event?agentId=priya&authId=MA_TEST0001", { Event: "DialAnswer", DialAction: "answer", CallUUID: callUuid, DialBLegUUID: "bleg-uuid-1" });
   await waitFor(() => notifies().length >= 1);
   await tick();
   check("answered is reported exactly once", notifies().filter(n => n.fields.state === "answered").length === 1, notifies().map(n => n.fields.state));
 
-  r = await post("/dial-result?agentId=priya", { CallUUID: callUuid, DialStatus: "completed", DialBLegUUID: "bleg-uuid-1" });
+  r = await post("/dial-result?agentId=priya&authId=MA_TEST0001", { CallUUID: callUuid, DialStatus: "completed", DialBLegUUID: "bleg-uuid-1" });
   check("dial-result answers an empty <Response>", /<Response><\/Response>/.test(await r.text()));
 
   received.length = 0;
-  await post("/recording-ready?agentId=priya", { Event: "RecordStop", CallUUID: callUuid, RecordingID: "rec-1", RecordingDuration: "30" });
+  await post("/recording-ready?agentId=priya&authId=MA_TEST0001", { Event: "RecordStop", CallUUID: callUuid, RecordingID: "rec-1", RecordingDuration: "30" });
   await waitFor(() => notifies().length >= 1);
   const ended = notifies()[0];
   check("the call log lands with the recording (browser-originated calls used to lose it)", ended && ended.fields.state === "ended" && Boolean(ended.fields.voiceuri), ended && ended.fields);
   check("duration is the customer leg's billed time", ended && ended.fields.duration === "37", ended && ended.fields);
   check("ended carries a GMT start_time", ended && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(ended.fields.start_time));
-  check("the recording link carries no Vobiz credential", ended && !ended.fields.voiceuri.includes("test-auth-token") && !ended.fields.voiceuri.includes("MA_TEST"));
+  check("the recording link carries no Vobiz token, and names its account", ended && !ended.fields.voiceuri.includes("tok-") && ended.fields.voiceuri.includes("authId=MA_TEST0001"), ended && ended.fields.voiceuri);
 
-  const link = ended.fields.voiceuri.replace("https://example.test", "");
+  const link = recordingLink = ended.fields.voiceuri.replace("https://example.test", "");
+  vobizCalls = [];
   r = await req(link);
   check("the signed recording link streams audio", r.status === 200 && (r.headers.get("content-type") || "").includes("audio"), r.status);
+  check("fetched with that account's credentials only", vobizCalls.length > 0 && vobizCalls.every(c => c.headers["X-Auth-ID"] === "MA_TEST0001" && c.headers["X-Auth-Token"] === "tok-one-secret-value"), vobizCalls.map(c => c.headers["X-Auth-ID"]));
   r = await req(link.replace(/sig=[0-9a-f]+/, "sig=" + "0".repeat(64)));
   check("a bad signature is 403", r.status === 403);
   recordingUrlForStub = "https://example.com/";
@@ -407,7 +530,8 @@ async function testClickToDial(orgId, uris) {
   recordingUrlForStub = "https://media.vobiz.ai/recordings/rec-1.mp3";
 
   // Zoho says another mapped user clicked a URI registered for priya: route to that user's agent.
-  const arjunPhone = await openSoftphone("arjun");
+  arjunPhone = await openSoftphone("arjun", ACCT2);
+  check("arjun signs in with a different account, MA_TEST0002", arjunPhone.status === 200 && arjunPhone.vobiz.authId === "MA_TEST0002", arjunPhone.vobiz);
   await tick();
   r = await post(uris["600001"], { tonumber: "+919999900002", zohouser: "600002" });
   await waitFor(() => arjunPhone.events.some(e => e.type === "dial"));
@@ -417,11 +541,13 @@ async function testClickToDial(orgId, uris) {
 }
 
 async function testInbound(orgId) {
-  console.log("\n[7] Inbound — callerId is the dialled DID, and the call is logged in Zoho");
+  console.log("\n[7] Inbound — routed by the dialled DID to that account's signed-in agents");
   received.length = 0;
-  const r = await post("/inbound-answer?agentId=priya", { CallUUID: "in-uuid-1", From: "919800000000", To: "918000000000" });
-  const xml = await r.text();
-  check("the <Dial> carries callerId = the DID", xml.includes('callerId="+918000000000"'), xml);
+  let r = await post("/answer", { CallUUID: "in-uuid-1", From: "919800000000", To: "910000000001" });
+  let xml = await r.text();
+  check("a call to MA_TEST0001's DID rings priya's provisioned endpoint", xml.includes(`<User>sip:${sipUserOf(priyaPhone)}@registrar.vobiz.ai</User>`), xml);
+  check("and not the other account's agent", !xml.includes(sipUserOf(arjunPhone)));
+  check("the <Dial> carries callerId = the DID", xml.includes('callerId="+910000000001"'), xml);
   check("rings for 20 seconds, as documented", xml.includes('timeout="20"'));
   check("then voicemail", xml.includes("leave a message"));
   await waitFor(() => notifies().length >= 1);
@@ -433,6 +559,18 @@ async function testInbound(orgId) {
   const ended = notifies()[0];
   check("an unanswered inbound call is logged as ended/0s, accepted by Zoho", ended && ended.fields.state === "ended" && ended.fields.duration === "0", ended && ended.fields);
 
+  r = await post("/answer", { CallUUID: "in-uuid-2", From: "919800000000", To: "910000000003" });
+  xml = await r.text();
+  check("a call to MA_TEST0002's DID rings arjun, not priya", xml.includes(sipUserOf(arjunPhone)) && !xml.includes(sipUserOf(priyaPhone)), xml);
+
+  r = await post("/inbound-answer?agentId=priya", { CallUUID: "in-uuid-3", From: "919800000000", To: "910000000003" });
+  xml = await r.text();
+  check("the old /inbound-answer routes by DID too, ignoring ?agentId=", xml.includes(sipUserOf(arjunPhone)) && !xml.includes(sipUserOf(priyaPhone)), xml);
+
+  r = await post("/answer", { CallUUID: "in-uuid-4", From: "919800000000", To: "910000000077" });
+  xml = await r.text();
+  check("a DID no signed-in account owns gets a polite hangup", xml.includes("<Hangup/>") && !xml.includes("<Dial"), xml);
+
   const hang = await post("/inbound-answer?agentId=priya", { Event: "Hangup", CallUUID: "in-uuid-1" });
   check("a Hangup event is acknowledged, not answered with <Dial>", !(await hang.text()).includes("<Dial"));
 }
@@ -440,7 +578,9 @@ async function testInbound(orgId) {
 async function testCallbackContract() {
   console.log("\n[8] Callback contract and the missed state");
   let r = await post("/answer", { CallUUID: "x", From: "+911", To: "+912" });
-  check("/answer for no known agent speaks and hangs up instead of crashing", (await r.text()).includes("cannot be connected"));
+  check("/answer for no known agent or DID hangs up politely instead of crashing", /<Hangup\/>/.test(await r.text()));
+  r = await post("/answer", { CallUUID: "x", From: "sip:nobody@registrar.vobiz.ai", To: "+912" });
+  check("/answer from an unknown SIP user says it cannot connect", (await r.text()).includes("cannot be connected"));
   r = await post("/answer?agentId=priya", { CallUUID: "x", Event: "Hangup" });
   check("/answer acknowledges Hangup with an empty document", /<Response><\/Response>/.test(await r.text()));
 
@@ -452,11 +592,120 @@ async function testCallbackContract() {
   check("missed carries no duration", !("duration" in received[0].fields));
 
   const nonce = "abc123";
-  const sig = crypto.createHmac("sha256", "test-auth-token").update(`https://example.test/answer.${nonce}`).digest("base64");
+  const sig = crypto.createHmac("sha256", "tok-one-secret-value").update(`https://example.test/answer.${nonce}`).digest("base64");
   const fake = h => ({ headers: h });
   const u = new URL("https://x/answer?agentId=priya");
-  check("a correct X-Vobiz-Signature-V3 verifies (query string excluded)", verifyVobizSignature(fake({ "x-vobiz-signature-v3": sig, "x-vobiz-signature-v3-nonce": nonce }), u));
-  check("a wrong one does not", !verifyVobizSignature(fake({ "x-vobiz-signature-v3": sig, "x-vobiz-signature-v3-nonce": "other" }), u));
+  check("a correct X-Vobiz-Signature-V3 verifies (query string excluded)", verifyVobizSignature(fake({ "x-vobiz-signature-v3": sig, "x-vobiz-signature-v3-nonce": nonce }), u, "tok-one-secret-value"));
+  check("a wrong one does not", !verifyVobizSignature(fake({ "x-vobiz-signature-v3": sig, "x-vobiz-signature-v3-nonce": "other" }), u, "tok-one-secret-value"));
+  check("nor does the right one checked against another account's token", !verifyVobizSignature(fake({ "x-vobiz-signature-v3": sig, "x-vobiz-signature-v3-nonce": nonce }), u, "tok-two-secret-value"));
+}
+
+async function testAnyAccount(orgId) {
+  console.log("\n[11] Any Vobiz account — sign-in, provisioning, routing, isolation");
+  const disk = fs.readFileSync(vobizAccounts.storeFile(), "utf8");
+  const store = JSON.parse(disk);
+  const e1 = store["MA_TEST0001:priya"];
+  const e2 = store["MA_TEST0002:arjun"];
+  check("two accounts get two distinct endpoints", e1 && e2 && e1.endpointId !== e2.endpointId && e1.username !== e2.username, store);
+  check("the stored username is the one Vobiz rewrote, read back by GET", e1.username === sipUserOf(priyaPhone) && e1.username.endsWith(e1.endpointId));
+  check("the endpoint store is 0600", (fs.statSync(vobizAccounts.storeFile()).mode & 0o777) === 0o600);
+  check("and holds no password or token", !disk.includes(priyaPhone.vobiz.sipPassword) && !disk.includes("tok-") && !/password|token/i.test(disk), disk);
+  check("an existing application with our answer_url is reused, none created in MA_TEST0001", vobizState.MA_TEST0001.apps.length === 2);
+  check("account 2 got one application, answer_url and hangup_url on this backend", vobizState.MA_TEST0002.apps.length === 1 && vobizState.MA_TEST0002.apps[0].answer_url === "https://example.test/answer" && vobizState.MA_TEST0002.apps[0].hangup_url === "https://example.test/hangup", vobizState.MA_TEST0002.apps);
+  check("each endpoint is bound to its own account's application, 17-digit id intact",
+    vobizState.MA_TEST0001.endpoints[e1.endpointId].app === OUR_APP_1 && vobizState.MA_TEST0002.endpoints[e2.endpointId].app === NEW_APP_2);
+
+  // Re-sign-in: same endpoint, fresh password, exact bind bodies on the wire.
+  // Unbind it first, as if someone had changed it in the console.
+  vobizState.MA_TEST0001.endpoints[e1.endpointId].app = null;
+  vobizCalls = [];
+  const before = vobizState.MA_TEST0001.endpoints[e1.endpointId].password;
+  const cookie = await agentCookie("priya");
+  let r = await postJson("/agent/vobiz-session", ACCT1, { Cookie: cookie });
+  let body = await r.json();
+  check("signing in again remembers the agent's caller ID choice", body.callerId === "+910000000002", body.callerId);
+  check("signing in again reuses the endpoint", r.status === 200 && body.sipUser.startsWith(e1.username + "@") && Object.keys(vobizState.MA_TEST0001.endpoints).length === 1, body);
+  check("with a fresh SIP password", body.sipPassword && body.sipPassword !== before && vobizState.MA_TEST0001.endpoints[e1.endpointId].password === body.sipPassword);
+  const binds = vobizCalls.filter(c => c.method === "POST" && /\/Endpoint\/\d+\/$/.test(c.target) && /app/.test(c.body)).map(c => c.body);
+  check('bind tries {"app_id":"43919358318796814"} first', binds[0] === '{"app_id":"43919358318796814"}', binds);
+  check('then the documented {"application":43919358318796814}, digit for digit', binds[1] === '{"application":43919358318796814}', binds);
+  check("never an application it did not create", !vobizCalls.some(c => c.body.includes("11111111111111111")));
+  check("the sign-in reply carries no Auth Token", !JSON.stringify(body).includes("tok-"));
+
+  r = await postJson("/agent/vobiz-session", { authId: "MA_TEST0001", authToken: "wrong-token" }, { Cookie: await agentCookie("nomatch") });
+  body = await r.json();
+  check("a wrong token is refused with 401 and a clear message", r.status === 401 && /did not accept/.test(body.error), body);
+  check("and signs nobody in", vobizAccounts.sessionFor("nomatch") === null);
+  r = await postJson("/agent/vobiz-session", ACCT1);
+  check("Vobiz sign-in without the agent link cookie is 401", r.status === 401);
+
+  // The webhook signature is checked with the right account's token.
+  process.env.REQUIRE_VOBIZ_SIGNATURE = "true";
+  const nonce = "n-1";
+  const sign = tok => ({ "X-Vobiz-Signature-V3": crypto.createHmac("sha256", tok).update(`https://example.test/answer.${nonce}`).digest("base64"), "X-Vobiz-Signature-V3-Nonce": nonce });
+  const from = { CallUUID: "sig-1", From: `sip:${e1.username}@registrar.vobiz.ai`, To: "919999900009" };
+  r = await post("/answer", from, sign("tok-two-secret-value"));
+  check("a webhook for MA_TEST0001 signed with MA_TEST0002's token is refused", /<Hangup\/>/.test(await r.text()));
+  r = await post("/answer", from, sign("tok-one-secret-value"));
+  check("signed with MA_TEST0001's own token it is accepted", /<Number>919999900009<\/Number>/.test(await r.text()));
+  delete process.env.REQUIRE_VOBIZ_SIGNATURE;
+
+  // Outbound caller ID: X-VH-Caller-ID, only a number of that account.
+  r = await post("/answer", { ...from, "X-VH-Caller-ID": "+910000000001" });
+  check("X-VH-Caller-ID picks the caller ID for the call", (await r.text()).includes('callerId="+910000000001"'));
+  r = await post("/answer", { ...from, "SIPHeader_X-VH-Caller-ID": "+910000000003" });
+  check("one from another account's numbers is ignored", (await r.text()).includes('callerId="+910000000002"'));
+
+  // Inbound by ParentAuthID.
+  r = await post("/answer", { CallUUID: "in-p-1", From: "919800000000", To: "07000000000", Direction: "inbound", ParentAuthID: "MA_TEST0002" });
+  let xml = await r.text();
+  check("ParentAuthID picks the account's agents for inbound", xml.includes(`<User>sip:${e2.username}@registrar.vobiz.ai</User>`) && !xml.includes(e1.username), xml);
+  check("callerId is the dialled To in E.164 (0XXXXXXXXXX -> +91XXXXXXXXXX)", xml.includes('callerId="+917000000000"'), xml);
+
+  // Enable inbound calls: explicit, account's own numbers only.
+  vobizCalls = [];
+  r = await postJson("/agent/enable-inbound", { number: "+910000000002" }, { Cookie: cookie });
+  body = await r.json();
+  const attach = vobizCalls.find(c => c.target.includes("/numbers/%2B910000000002/application"));
+  check("Enable inbound attaches the DID to our application", r.status === 200 && attach && attach.body === '{"application_id":"43919358318796814"}', attach);
+  check("and reports which application it moved from", body.previousApplicationId === OUR_APP_1, body);
+  r = await postJson("/agent/enable-inbound", { number: "+910000000003" }, { Cookie: cookie });
+  check("another account's number is refused", r.status === 400);
+
+  // Recording links are scoped to their account.
+  r = await req(recordingLink.replace("authId=MA_TEST0001", "authId=MA_TEST0002"));
+  check("a recording link moved to another account fails its signature", r.status === 403, r.status);
+
+  // SIP direct.
+  const sipPhone = await openSoftphone("nomatch", { sipUser: "custsip01", callerId: "+91 00000 00009" });
+  check("SIP direct sign-in takes a username and caller ID, no password", sipPhone.status === 200 && sipPhone.vobiz.callerId === "+910000000009" && !("sipPassword" in sipPhone.vobiz), sipPhone.vobiz);
+  r = await postJson("/agent/sip-session", { sipUser: "custsip01", callerId: "not-a-number" }, { Cookie: sipPhone.cookie });
+  check("a bad caller ID is refused", r.status === 400);
+  await tick();
+  const uri = `/zoho/phonebridge/clicktodial?orgId=${orgId}&agentId=nomatch&t=${auth.clickToDialToken(orgId, "nomatch")}`;
+  received.length = 0;
+  r = await post(uri, { tonumber: "+919999900003" });
+  check("Zoho click-to-dial works for a SIP-direct agent", r.status === 200, await r.text());
+  await waitFor(() => sipPhone.events.some(e => e.type === "dial"));
+  check("the number reaches that softphone", sipPhone.events.some(e => e.type === "dial" && e.to === "+919999900003"));
+  r = await post("/answer", { CallUUID: "sip-1", From: "sip:custsip01@registrar.vobiz.ai", To: "919999900003" });
+  xml = await r.text();
+  check("its /answer dials with the typed caller ID", xml.includes('callerId="+910000000009"') && xml.includes("<Number>919999900003</Number>"), xml);
+  r = await post("/answer", { CallUUID: "sip-in-1", From: "919800000000", To: "910000000009" });
+  check("inbound to its caller ID rings it", (await r.text()).includes("<User>sip:custsip01@registrar.vobiz.ai</User>"));
+  r = await postJson("/agent/enable-inbound", { number: "+910000000009" }, { Cookie: sipPhone.cookie });
+  body = await r.json();
+  check("account-only features say to sign in with a Vobiz account", r.status === 400 && /sign in with your Vobiz account/.test(body.error), body);
+  sipPhone.close();
+
+  r = await req("/zoho/phonebridge/status", { headers: ADMIN });
+  body = await r.json();
+  check("admin status lists signed-in accounts by id only", body.vobizAccounts.some(a => a.authId === "MA_TEST0001") && !JSON.stringify(body).includes("tok-"), body.vobizAccounts);
+
+  r = await post(uri.replace("agentId=nomatch", "agentId=priya").replace(/t=[^&]+/, `t=${auth.clickToDialToken(orgId, "priya")}`), { tonumber: "+919999900004" });
+  check("an agent signed in but with no softphone open is still AGENT_OFFLINE", r.status === 409);
+
+  check("no Auth Token appears in any HTTP response", !seenResponses.some(t => t.includes("tok-one-secret-value") || t.includes("tok-two-secret-value")));
 }
 
 async function testDisconnect(orgId) {
@@ -496,6 +745,7 @@ async function testNoAgentsFile() {
     await testClickToDial(orgId, uris);
     await testInbound(orgId);
     await testCallbackContract();
+    await testAnyAccount(orgId);
     await testDisconnect(orgId);
     await testNoAgentsFile();
   } catch (err) {

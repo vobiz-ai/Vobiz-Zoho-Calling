@@ -21,6 +21,7 @@
 | **Call states** | `ringing` / `answered` / `ended` reported as they happen. |
 | **Call logging** | Inbound and outbound written to the Zoho record, against the Zoho user who took the call. |
 | **Many agents** | Each Zoho user is mapped to a Vobiz agent; click-to-dial is registered per user. |
+| **Any Vobiz account** | Agents sign in from the softphone with their own Vobiz Auth ID + Auth Token; the backend sets up their line. No Vobiz credential, SIP login or number lives in `.env` or `agents.json`. |
 | **Recordings** | Delivered to the call log behind a signed URL. |
 | **Failed dials** | Reported to Zoho as `clicktodialerror`. |
 | **Browser audio** | Outbound and inbound, with an Accept / Decline banner. |
@@ -73,11 +74,15 @@ specification asks for.
                                        ──► the log lands on the record
 ```
 
-If the agent has no softphone open, the click is refused and Zoho is told
-`AGENT_OFFLINE`. Set `CLICKTODIAL_WHEN_OFFLINE=phone` to ring the agent's own
-phone (`phoneNumber` in `agents.json`) instead.
+If the agent has no softphone open, or has not signed in to Vobiz there, the
+click is refused and Zoho is told `AGENT_OFFLINE`. (The old
+`CLICKTODIAL_WHEN_OFFLINE=phone` fallback is gone: it needed a Vobiz account
+and a phone number configured on the server.)
 
-Inbound rings the softphone with an **Accept / Decline** banner rather than
+Inbound: a PSTN call to a DID reaches `/answer`, the account is identified by
+the webhook's `ParentAuthID` (falling back to which signed-in account owns the
+dialled `To`), and every signed-in agent of that account rings at once. A
+number nobody is signed in for gets a polite message and a hangup. Inbound rings the softphone with an **Accept / Decline** banner rather than
 answering automatically — Enter accepts, Escape declines. The agent has 20
 seconds before the caller falls through to voicemail. `INBOUND_RECORD=true`
 records inbound sessions.
@@ -86,19 +91,17 @@ records inbound sessions.
 
 ```bash
 cd backend
-cp .env.example .env            # fill in every value marked required
+cp .env.example .env            # deployment config only — no Vobiz credentials
 cp agents.example.json agents.json
 npm test                        # hermetic: no network, no real accounts
 npm start
 ```
 
-1. **Agents.** One entry per agent in `agents.json`: the Vobiz SIP endpoint
-   (`sipUser`, `sipPassword`), an optional `callerId`, and either `zohoUser`
-   (the Zoho PhoneBridge user id) or `email` (matched to the Zoho user's email).
-2. **Vobiz.** Create an application whose answer URL is
-   `<PUBLIC_BASE_URL>/answer` and attach every agent's endpoint to it. For
-   inbound, create an application with answer URL
-   `<PUBLIC_BASE_URL>/inbound-answer?agentId=<agent>` and attach your number.
+1. **Agents.** One entry per agent in `agents.json`: a `displayName` and either
+   `zohoUser` (the Zoho PhoneBridge user id) or `email` (matched to the Zoho
+   user's email). Nothing else — no SIP login, password or number.
+2. **Vobiz.** Nothing to set up by hand for agents who sign in with their Vobiz
+   account (see [Signing in to Vobiz](#signing-in-to-vobiz)).
 3. **Zoho OAuth client.** The client's redirect URI must be
    `<PUBLIC_BASE_URL>/oauth/zoho/callback`, and `ZOHO_PB_REDIRECT_URI` must
    match it exactly.
@@ -112,7 +115,73 @@ npm start
    unmatched. Pass `"defaultAgentId"` to also register an org-level URI.
 6. **Agents sign in.** `GET /admin/agent-links` (admin) returns one link per
    agent. Each agent opens theirs once; the key in the link is exchanged for a
-   session cookie and removed from the address bar.
+   session cookie and removed from the address bar. The softphone then asks
+   them to sign in to Vobiz.
+
+A Zoho org is not tied to a Vobiz account. Each click-to-dial goes out on
+whichever Vobiz account (or SIP endpoint) that agent signed in with.
+
+## Signing in to Vobiz
+
+The softphone has two tabs.
+
+**Vobiz account** (recommended). The agent types their Vobiz **Auth ID** and
+**Auth Token**. The backend:
+
+1. checks the pair with `GET /Account/{auth_id}/numbers` — a wrong pair is a
+   401 with a clear message;
+2. finds this integration's application in that account (the one whose
+   `answer_url` is `<PUBLIC_BASE_URL>/answer`) or creates it
+   (`answer_url` `/answer`, `hangup_url` `/hangup`, both POST). It never
+   changes an application it did not create;
+3. finds or creates one SIP endpoint for this agent in that account (alias
+   `zoho-<agentId>`), sets a fresh random SIP password on every sign-in, and
+   binds it to the application (`{"app_id":"<id>"}`, checked by reading the
+   endpoint back, then the documented `{"application":<id>}` if needed);
+4. hands the SIP login to that browser once. The password is never stored.
+
+Only `{endpointId, username}` per `(authId, agentId)` is written to disk, in
+`DATA_DIR/vobiz-endpoints.json` (mode 0600, gitignored). The Auth Token stays
+in the backend's memory, keyed by Auth ID; it is never returned to a browser,
+logged or written to disk.
+
+The caller ID is a dropdown of the account's **active, voice-enabled** numbers
+(List Account Phone Numbers, every page). The backend refuses any caller ID
+outside that list, and the panel also sends the choice as the
+`X-VH-Caller-ID` SIP header on each call.
+
+**Enable inbound calls** (button under the caller ID) attaches the selected
+number to this integration's application
+(`POST /numbers/%2B<digits>/application`). It only happens when the agent
+presses it, because it moves the number off whatever application answered it
+before — the panel names that application first.
+
+**SIP direct.** For an endpoint the customer already has: the agent types its
+SIP username and password and a caller-ID number (E.164). The password stays in
+the browser; the backend only learns the username and caller ID, and routes
+inbound calls to that caller ID to this agent. The customer has to wire Vobiz
+themselves:
+
+- **Console:** Voice → Applications → create an application with answer URL
+  `<PUBLIC_BASE_URL>/answer` (POST) and hangup URL `<PUBLIC_BASE_URL>/hangup`;
+  open the endpoint and select that application; for inbound, open the number
+  and select the same application.
+- **API equivalent:** `POST /api/v1/Account/{auth_id}/Application/`
+  `{"app_name":"Vobiz-Zoho-PhoneBridge","answer_url":"<PUBLIC_BASE_URL>/answer","answer_method":"POST"}`,
+  then `POST /Endpoint/{endpoint_id}/` `{"application":<app_id>}` and
+  `POST /numbers/%2B<digits>/application` `{"application_id":"<app_id>"}`.
+
+In SIP-direct mode there is no account API, so the caller-ID list, "Enable
+inbound calls", recording links in the Zoho log and billed duration are not
+available — the panel says to sign in with a Vobiz account to use them. Vobiz
+itself refuses a caller ID the account does not own. Webhooks for SIP-direct
+calls cannot be signature-checked (the backend has no token), so they follow
+the unknown-account policy below.
+
+**After a restart** the backend holds no Auth Tokens. Agents sign in again
+from the softphone; until one agent of an account has, that account's
+recording links answer "sign in again" (503) and its webhooks are treated as
+unverifiable.
 
 To remove an org: `POST /zoho/phonebridge/disconnect {"orgId": "..."}` (admin)
 deregisters click-to-dial, revokes the refresh token at Zoho and deletes our copy.
@@ -181,8 +250,9 @@ start_time = "2026-09-15T12:00:00.000Z"  ← ISO 8601 is REJECTED
 
 ## Running the agent softphone
 
-Open the agent's sign-in link from `/admin/agent-links`, allow the microphone,
-and wait for the green dot. The page is served from the backend, so it shares
+Open the agent's sign-in link from `/admin/agent-links`, sign in to Vobiz on
+one of the two tabs, allow the microphone, and wait for the green dot. A page
+reload signs in to Vobiz again (and rotates the SIP password). The page is served from the backend, so it shares
 an origin with the API and the event stream.
 
 ## Notes and gotchas
@@ -206,11 +276,24 @@ rings in the browser forever. Bind audio via the `peerconnection` event instead.
 
 **Recordings need a signed URL, and the account credentials behind it.** Zoho
 fetches `voiceuri` with no Vobiz credentials of its own, and comes back for the
-audio long after any agent session has gone. The HMAC signature is what
-authenticates the request; the fetch itself runs server-side.
+audio long after any agent session has gone. The HMAC signature — over the
+Auth ID, agent, recording id and expiry — is what authenticates the request,
+so a link for one account can never fetch another's audio; the fetch itself
+runs server-side with that account's in-memory token.
+
+**Vobiz app ids are 17 digits**, above `Number.MAX_SAFE_INTEGER`. They are
+kept as strings: long integers in Vobiz responses are quoted before
+`JSON.parse`, and request bodies are built as text with the id spliced in.
+
+**Webhook signatures use the account's own token.** The backend works out the
+account from the SIP username (browser calls), `ParentAuthID` or the dialled
+DID (inbound), or the `authId` on its own callback URLs, and checks
+`X-Vobiz-Signature-V3` with that account's token. An account with no token in
+memory is treated like a bad signature: accepted with a warning by default,
+refused with `REQUIRE_VOBIZ_SIGNATURE=true`.
 
 **Put `DATA_DIR` on a persistent disk.** Connected orgs live in
-`DATA_DIR/zoho-orgs.json`. On a host with an ephemeral filesystem, a restart
+`DATA_DIR/zoho-orgs.json` and endpoint ids in `DATA_DIR/vobiz-endpoints.json`. On a host with an ephemeral filesystem, a restart
 without a persistent disk loses them and each org has to reconnect.
 
 **Ignore `sip_registered`.** It never flips to `"true"` for WebSocket
@@ -233,8 +316,10 @@ nowhere near the cause:
   place.
 - **Agent sessions last 12 hours** and live in a signed cookie; there is no
   per-agent revocation short of rotating `APP_SECRET`.
-- **Inbound rings one agent per number**, the one named in that number's
-  application answer URL.
+- **Inbound rings every signed-in agent of the account** at once; there is no
+  per-number agent assignment yet.
+- **Auth Tokens are in memory only.** After a restart, recordings and
+  signature checks for an account wait until one of its agents signs in again.
 - **One process.** Call state in flight is held in memory, so run a single
   instance; a restart mid-call loses that call's final log entry.
 
