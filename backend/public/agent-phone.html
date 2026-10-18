@@ -77,25 +77,18 @@
  *
  * The browser is the A leg: it places the INVITE itself and the backend answers
  * with <Dial><Number> to reach the customer. The reverse — backend originates to
- * the customer and bridges the browser in with <Dial><User> — is what the rest
- * of this repository was built around, and it does not work: routing into a
- * registered WebRTC endpoint is broken platform-side. See ISSUES.md.
+ * the customer over REST and bridges the browser in with <Dial><User> — does
+ * not work and is not used.
  *
  * Zoho never opens this page itself. Zoho draws its own call bar and POSTs
  * click-to-dial to the backend; the backend relays that here over the existing
  * /call-events SSE stream, and this page does the dialling.
  */
-const params = new URLSearchParams(location.search);
-const AGENT  = params.get("agentId") || "test-agent";
-
-// The backend is wherever THIS page was served from — directory included.
-// Using location.origin alone breaks the moment the backend sits behind a path
-// prefix (a tunnel fronting several services, say): the API calls lose the
-// prefix, land on whatever answers the bare path, and the first symptom is a
-// JSON parse error on some other service's response body.
-const HERE    = location.pathname.replace(/\/[^/]*$/, "");   // "/zoho" → "", "/zoho/agent-phone" → "/zoho"
-const BACKEND = (params.get("backend") || location.origin + HERE).replace(/\/+$/, "");
-
+// The backend is wherever THIS page was served from — directory included, so a
+// path prefix in front of the backend keeps working.
+const HERE    = location.pathname.replace(/\/[^/]*$/, "");
+const BACKEND = (location.origin + HERE).replace(/\/+$/, "");
+let AGENT = null;
 const el = id => document.getElementById(id);
 const log = (msg, strong) => {
   const t = new Date().toTimeString().slice(0, 8);
@@ -130,20 +123,46 @@ function attachAudio(s) {
   bind(s.connection);
 }
 
+/**
+ * Sign-in. An admin hands each agent a link ending in #agent=<id>&key=<key>
+ * (GET /admin/agent-links). The fragment never reaches the server or its logs;
+ * it is exchanged once for an HttpOnly session cookie and then wiped from the
+ * address bar. Nothing is kept in localStorage.
+ */
+async function signInFromFragment() {
+  const frag = new URLSearchParams(location.hash.replace(/^#/, ""));
+  const agentId = frag.get("agent"), key = frag.get("key");
+  if (!agentId || !key) return;
+  history.replaceState(null, "", location.pathname + location.search);
+  const res = await fetch(`${BACKEND}/agent-session`, {
+    method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agentId, key }),
+  });
+  if (!res.ok) log("that sign-in link was not accepted — ask your admin for a new one", true);
+}
+
 async function start() {
   let agent;
   try {
-    const res = await fetch(`${BACKEND}/agent/${encodeURIComponent(AGENT)}`, {
+    await signInFromFragment();
+    const res = await fetch(`${BACKEND}/agent/me`, {
+      credentials: "same-origin",
       headers: { "ngrok-skip-browser-warning": "1" },
     });
+    if (res.status === 401) {
+      setStatus("Not signed in", "err");
+      log("open the sign-in link your admin gave you (it ends in #agent=…&key=…)", true);
+      return;
+    }
     if (!res.ok) throw new Error(`backend returned ${res.status}`);
     agent = await res.json();
+    AGENT = agent.agentId;
   } catch (err) {
     setStatus("Cannot reach the backend", "err");
-    log(`GET ${BACKEND}/agent/${AGENT} failed — ${err.message}`, true);
+    log(`GET ${BACKEND}/agent/me failed — ${err.message}`, true);
     return;
   }
-
   el("who").textContent = `${agent.displayName || AGENT} · ${agent.sipUser}`;
   setStatus("Connecting…");
 
@@ -173,9 +192,8 @@ async function start() {
   });
 
   // Inbound: a PSTN caller reached the DID and the backend bridged to <User>.
-  // Currently blocked platform-side, but the handler is correct for when it is not.
-  // Inbound calls ring and wait for the agent. The <Dial> on the backend gives
-  // them 20 seconds; after that VoBiz gives up and the caller hears voicemail.
+  // The call rings and waits for the agent. The <Dial> on the backend gives
+  // them 20 seconds; after that the caller hears voicemail.
   ua.on("newRTCSession", ({ originator, session: s }) => {
     if (originator !== "remote") return;
     clearInboundWatch();
@@ -320,9 +338,9 @@ function declineCall() {
 
 /**
  * The backend saw a PSTN call routed to this agent and said so. Whether VoBiz
- * then actually rings this browser is the open question — <Dial><User> into a
- * registered WebRTC endpoint is currently dropped platform-side, and when it is
- * dropped *nothing at all* happens here: no ring, no error, no SIP event. That
+ * then actually rings this browser is not guaranteed — when an INVITE to a
+ * registered WebRTC endpoint is dropped, *nothing at all* happens here: no
+ * ring, no error, no SIP event. That
  * is indistinguishable from a broken panel unless somebody says otherwise.
  *
  * So: announce the call, then wait. A real INVITE clears this. Silence gets
@@ -343,14 +361,14 @@ function watchForInbound(from, callUuid) {
     inboundWatch = null;
     setStatus("VoBiz never rang this browser", "err");
     log(`no INVITE arrived in ${INBOUND_GRACE_MS / 1000}s — the caller heard voicemail instead.`, true);
-    log(`this is the platform-side <Dial><User> defect, not a fault in this page${callUuid ? ` (CallUUID ${callUuid})` : ""}`);
+    log(`Vobiz did not deliver the call to this browser${callUuid ? ` (CallUUID ${callUuid})` : ""} — reload this page to re-register, then try again`);
     setTimeout(() => { if (registered) setStatus("Ready", "on"); }, 6000);
   }, INBOUND_GRACE_MS);
 }
 
 /** Zoho click-to-dial arrives at the backend, which relays it here. */
 function listenForClickToDial() {
-  const src = new EventSource(`${BACKEND}/call-events/${encodeURIComponent(AGENT)}`);
+  const src = new EventSource(`${BACKEND}/call-events`, { withCredentials: true });
   src.onopen = () => log("listening for Zoho click-to-dial");
   src.onerror = () => log("click-to-dial stream dropped — retrying");
   src.onmessage = e => {
