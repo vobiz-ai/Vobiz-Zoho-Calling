@@ -258,6 +258,7 @@ async function signInSipDirect() {
     showLineCard("sip");
     el("who").textContent = `${agent.displayName || AGENT} · SIP direct · ${out.sipUser} · ${out.callerId}`;
     startPhone(out.sipUser, sipPassword);
+    requestMicrophone();
   } catch (err) {
     setStatus("Cannot reach the backend", "err");
     log(`SIP sign-in failed — ${err.message}`, true);
@@ -289,12 +290,41 @@ async function signInToVobiz(e) {
     showLineCard("account");
     el("who").textContent = `${agent.displayName || AGENT} · ${out.authId} · ${out.sipUser}`;
     if (out.applicationBound === false) log("the SIP endpoint could not be bound to the application — outbound calls may not connect", true);
+    if (out.reusedSession) log("you are signed in in another tab too — this tab shares its line; Zoho click-to-dial goes to the tab opened last", true);
     startPhone(out.sipUser, out.sipPassword);
+    requestMicrophone();
   } catch (err) {
     setStatus("Cannot reach the backend", "err");
     log(`Vobiz sign-in failed — ${err.message}`, true);
   } finally {
     el("vobizSignIn").disabled = false;
+  }
+}
+
+/**
+ * Ask for the microphone right after sign-in, not in the middle of the first
+ * call — a permission prompt during call setup is what drops calls or leaves
+ * them silent. The stream is stopped at once; only the permission is kept.
+ */
+let micBlocked = false;
+async function requestMicrophone() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    micBlocked = true;
+    setStatus("No microphone access on this page", "err");
+    log("this browser gives this page no microphone — open the softphone over HTTPS in Chrome, Edge or Firefox", true);
+    return false;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    stream.getTracks().forEach(t => t.stop());
+    micBlocked = false;
+    log("microphone allowed");
+    return true;
+  } catch (err) {
+    micBlocked = true;
+    setStatus("Microphone blocked — calls will have no audio", "err");
+    log(`microphone ${err && err.name === "NotAllowedError" ? "permission was denied" : "is unavailable"} — allow it for this site (the icon left of the address bar), then reload this page`, true);
+    return false;
   }
 }
 
@@ -326,12 +356,13 @@ async function enableInbound() {
   if (!number) return;
   const info = numberInfo.find(n => n.e164 === number) || {};
   if (info.ours) { log(`${number} already rings this integration`, true); return; }
-  const from = info.applicationId ? `application ${info.applicationId}` : "no application";
+  const appLabel = (name, id) => name ? `the application "${name}"` : id ? `application ${id}` : "no application";
+  const from = appLabel(info.applicationName, info.applicationId);
   if (!confirm(`Route incoming calls on ${number} to this integration? It moves off ${from}.`)) return;
   const res = await postJson("/agent/enable-inbound", { number });
   const out = await res.json().catch(() => ({}));
-  if (res.ok) { info.ours = true; info.applicationId = out.applicationId; fillNumbers(numberInfo, number); }
-  log(res.ok ? `inbound calls on ${out.number} now ring signed-in agents (moved off ${out.previousApplicationId || "no application"})` : (out.error || "could not enable inbound calls"), true);
+  if (res.ok) { info.ours = true; info.applicationId = out.applicationId; info.applicationName = null; fillNumbers(numberInfo, number); }
+  log(res.ok ? `inbound calls on ${out.number} now ring signed-in agents (moved off ${appLabel(out.previousApplicationName, out.previousApplicationId)})` : (out.error || "could not enable inbound calls"), true);
 }
 
 async function signOutOfVobiz() {
@@ -363,7 +394,11 @@ function startPhone(sipUser, sipPassword) {
 
   ua.on("connected",    () => log("websocket connected"));
   ua.on("disconnected", () => { setStatus("Disconnected", "err"); setRegistered(false); });
-  ua.on("registered",   () => { setStatus(`Ready — ${agent.displayName || AGENT}`, "on"); setRegistered(true); log("registered", true); });
+  ua.on("registered",   () => {
+    if (micBlocked) setStatus("Registered, but the microphone is blocked — allow it and reload", "err");
+    else setStatus(`Ready — ${agent.displayName || AGENT}`, "on");
+    setRegistered(true); log("registered", true);
+  });
   ua.on("unregistered", () => { setStatus("Not registered", "err"); setRegistered(false); });
   ua.on("registrationFailed", e => {
     setStatus(`Registration failed: ${(e && e.cause) || "unknown"}`, "err");
@@ -503,7 +538,12 @@ function acceptCall() {
     showInCall(true);
     setStatus("On a call", "on");
     log("accepted", true);
-    session.on("confirmed", () => setStatus("On a call", "on"));
+    const answeredUuid = lastRoutedCallUuid;
+    session.on("confirmed", () => {
+      setStatus("On a call", "on");
+      // Tell the backend this agent took the call, so the Zoho log is theirs.
+      if (answeredUuid) postJson("/agent/inbound-answered", { callUuid: answeredUuid }).catch(() => {});
+    });
   } catch (err) {
     log(`could not answer — ${err.message}`, true);
     try { session.terminate(); } catch {}
@@ -529,6 +569,7 @@ function declineCall() {
  * named for what it is.
  */
 let inboundWatch = null;
+let lastRoutedCallUuid = null;
 const INBOUND_GRACE_MS = 22000;   // the inbound XML dials <User> with timeout="20"
 
 function clearInboundWatch() {
@@ -537,6 +578,7 @@ function clearInboundWatch() {
 
 function watchForInbound(from, callUuid) {
   clearInboundWatch();
+  lastRoutedCallUuid = callUuid || null;
   log(`inbound call from ${from} routed to this agent — waiting for Vobiz to ring this browser`, true);
   setStatus(`Incoming from ${from}…`);
   inboundWatch = setTimeout(() => {
@@ -560,6 +602,9 @@ function listenForClickToDial() {
       log(`Zoho asked for ${ev.to}`, true);
       el("to").value = ev.to;
       dial(ev.to);
+    }
+    if (ev.type === "dial-elsewhere") {
+      log(`Zoho asked for ${ev.to || "a number"} — dialled in your other softphone tab (the one opened last)`, true);
     }
     if (ev.type === "inbound-routed") {
       watchForInbound(ev.from, ev.callUuid);

@@ -14,7 +14,8 @@
  *   public   /health, /agent-phone, /jssip.min.js, /admin/login
  *   agent    /agent/me, /call-events,            vz_agent cookie
  *            /agent/vobiz-session, /agent/sip-session,
- *            /agent/caller-id, /agent/enable-inbound
+ *            /agent/caller-id, /agent/enable-inbound,
+ *            /agent/inbound-answered
  *   admin    /zoho/phonebridge/{connect,complete,register,disconnect,status,debug},
  *            /admin/agent-links                  ADMIN_TOKEN
  *   Zoho     /zoho/phonebridge/clicktodial        HMAC token in the registered URI
@@ -79,6 +80,13 @@ const ZOHO_PB_RECORDING_GRACE_MS = Number(process.env.ZOHO_PB_RECORDING_GRACE_MS
 // live missed call.
 const ZOHO_PB_SEND_MISSED_STATE = process.env.ZOHO_PB_SEND_MISSED_STATE === "true";
 
+// Outbound calls are recorded unless OUTBOUND_RECORD=false. Read per call.
+const outboundRecordEnabled = () => String(process.env.OUTBOUND_RECORD || "").trim().toLowerCase() !== "false";
+
+// A click-to-dial handed to a softphone is bound to the next call that tab
+// places to the same number within this window; anything else is a manual dial.
+const PENDING_CLICK_TO_DIAL_MS = 2 * 60 * 1000;
+
 const MAX_BODY_BYTES = 64 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -102,6 +110,20 @@ function pushAgentEvent(agentId, event) {
   if (!listeners) return;
   const payload = `data: ${JSON.stringify(event)}\n\n`;
   for (const res of listeners) res.write(payload);
+}
+
+/**
+ * Click-to-dial goes to ONE tab: the agent's most recently connected softphone
+ * tab (a Set iterates in insertion order, so that is the last one). Any other
+ * open tab is told where the call went, so it is not a silent no-op there.
+ */
+function pushToNewestTab(agentId, event, elsewhere) {
+  const listeners = callEventListeners.get(agentId);
+  if (!listeners || !listeners.size) return;
+  const all = [...listeners];
+  const newest = all[all.length - 1];
+  newest.write(`data: ${JSON.stringify(event)}\n\n`);
+  if (elsewhere) for (const res of all.slice(0, -1)) res.write(`data: ${JSON.stringify(elsewhere)}\n\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -251,11 +273,14 @@ function vobizXmlDialCustomer(to, callerId, agentId, authId, publicBaseUrl) {
   // Same raw "&" in the attribute as the inbound XML that has run live.
   const qs = `agentId=${encodeURIComponent(agentId)}&authId=${encodeURIComponent(authId)}`;
   const callerIdAttr = callerId ? ` callerId="${escapeXml(callerId)}"` : "";
+  // <Record> is a sibling before <Dial>, never nested. OUTBOUND_RECORD=false
+  // drops it; the call log then lands from /dial-result without audio.
+  const record = outboundRecordEnabled()
+    ? `  <Record recordSession="true" redirect="false" playBeep="false" fileFormat="mp3"\n    callbackUrl="${publicBaseUrl}/recording-ready?${qs}" callbackMethod="POST"/>\n`
+    : "";
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Record recordSession="true" redirect="false" playBeep="false" fileFormat="mp3"
-    callbackUrl="${publicBaseUrl}/recording-ready?${qs}" callbackMethod="POST"/>
-  <Dial${callerIdAttr} timeout="30" timeLimit="14400" redirect="false" method="POST"
+${record}  <Dial${callerIdAttr} timeout="30" timeLimit="14400" redirect="false" method="POST"
     action="${publicBaseUrl}/dial-result?${qs}"
     callbackUrl="${publicBaseUrl}/dial-event?${qs}" callbackMethod="POST">
     <Number>${escapeXml(String(to).replace(/^\+/, ""))}</Number>
@@ -405,11 +430,21 @@ async function handleAnswer(req, res, url) {
   const callUuid = body.CallUUID || body.call_uuid || body.RequestUUID;
   const customer = body.To || body.to;
   console.log(`[backend] /answer — ${agentId}'s browser is the A leg (${session.authId || "SIP direct"}), dialling ${customer}`);
-  const pending = pendingBrowserCalls.get(agentId);
-  if (pending && callUuid && !zohoPhoneBridge.getTrackedCall(callUuid)) {
-    pendingBrowserCalls.delete(agentId);
-    zohoPhoneBridge.trackCall(callUuid, { ...pending, authId: session.authId, startedAtMs: Date.now() });
-    console.log(`[zoho-pb] bound ${pending.callId} to CallUUID ${callUuid}`);
+  // A click-to-dial waiting for this tab is bound only to a call to the same
+  // number, placed soon after the click. Any other call is a number the agent
+  // typed by hand, logged further down once the caller ID is known.
+  let manualDial = false;
+  if (callUuid && !zohoPhoneBridge.getTrackedCall(callUuid)) {
+    const pending = pendingBrowserCalls.get(agentId);
+    const fresh = pending && Date.now() - pending.createdAtMs < PENDING_CLICK_TO_DIAL_MS;
+    if (pending && !fresh) pendingBrowserCalls.delete(agentId);
+    if (fresh && sameNumber(pending.to, customer)) {
+      pendingBrowserCalls.delete(agentId);
+      zohoPhoneBridge.trackCall(callUuid, { ...pending, authId: session.authId, startedAtMs: Date.now() });
+      console.log(`[zoho-pb] bound ${pending.callId} to CallUUID ${callUuid}`);
+    } else {
+      manualDial = true;
+    }
   }
   // X-VH-Caller-ID on the INVITE (the panel sets it) wins over the caller ID
   // recorded at sign-in, when it is a valid number the session may use.
@@ -423,7 +458,39 @@ async function handleAnswer(req, res, url) {
     console.warn(`[backend] /answer — ${agentId} has no caller ID; their Vobiz account has no numbers`);
     return sendXml(res, `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>This line has no caller ID configured.</Speak><Hangup/></Response>`);
   }
+  if (manualDial) trackManualDial(callUuid, agentId, session, customer);
   return sendXml(res, vobizXmlDialCustomer(customer, session.callerId, agentId, session.authId || "", publicBaseUrl));
+}
+
+const sameNumber = (a, b) => {
+  const da = String(a || "").replace(/\D/g, "");
+  const db = String(b || "").replace(/\D/g, "");
+  return Boolean(da) && da === db;
+};
+
+/**
+ * A number the agent typed into the softphone. Logged in Zoho exactly like a
+ * click-to-dial call — dialed/ringing now, answered and ended from the same
+ * webhooks — against the Zoho user the agent is mapped to. An agent with no
+ * Zoho user in any connected org is not logged.
+ */
+function trackManualDial(callUuid, agentId, session, customer) {
+  const orgId = zohoPhoneBridge.orgForAgent(agentId);
+  const org = orgId && zohoPhoneBridge.getOrg(orgId);
+  const zohoUser = (org && org.agentMap && org.agentMap[agentId]) || null;
+  if (!zohoUser) {
+    console.log(`[zoho-pb] manual dial by ${agentId} not logged — the agent is not mapped to a Zoho user`);
+    return;
+  }
+  const tracked = zohoPhoneBridge.trackCall(callUuid, {
+    orgId, callId: `vobiz-manual-${callUuid}`, agentId, authId: session.authId, zohoUser,
+    type: "dialed", from: session.callerId, to: toE164(customer), startedAtMs: Date.now(), manual: true,
+  });
+  console.log(`[zoho-pb] logging manual dial ${tracked.callId} by ${agentId} to ${tracked.to}`);
+  zohoPhoneBridge.notifyCall({
+    orgId, type: "dialed", state: "ringing", callId: tracked.callId,
+    from: tracked.from, to: tracked.to, zohoUser, credentials: pbCredentials(),
+  }).catch(err => console.error("[zoho-pb] manual dial ringing notify failed:", err.message));
 }
 
 /** hangup_url of the provisioned application: acknowledge, nothing else. */
@@ -460,6 +527,41 @@ function trackedFor(callUuid, authId) {
   return tracked;
 }
 
+/**
+ * An inbound call rings every signed-in agent of the account; the call log
+ * belongs to the one who answered. Attributes the tracked call to `agentId`
+ * when that agent was one of those rung and is mapped to a Zoho user in the
+ * org the call is logged in. The first attribution wins: DialBLegTo on the
+ * Dial callback when Vobiz names the leg, else the softphone's own report.
+ */
+function attributeInboundTo(callUuid, agentId, how) {
+  const tracked = callUuid && agentId && zohoPhoneBridge.getTrackedCall(callUuid);
+  if (!tracked || tracked.type !== "received") return false;
+  if (!(tracked.ringingAgents || []).some(a => a.agentId === agentId)) return false;
+  if (tracked.answeredBy) return tracked.answeredBy === agentId;
+  const org = zohoPhoneBridge.getOrg(tracked.orgId);
+  const zohoUser = (org && org.agentMap && org.agentMap[agentId]) || null;
+  const patch = { answeredBy: agentId };
+  if (zohoUser) {
+    patch.agentId = agentId;
+    patch.zohoUser = zohoUser;
+  } else {
+    console.warn(`[zoho-pb] ${tracked.callId} answered by ${agentId}, who has no Zoho user in ${tracked.orgId} — logged against ${tracked.agentId}`);
+  }
+  zohoPhoneBridge.updateTrackedCall(callUuid, patch);
+  console.log(`[zoho-pb] ${tracked.callId} answered by ${agentId} (${how})`);
+  return true;
+}
+
+/** "sip:zohopriya123@registrar.vobiz.ai" -> the ringing agent with that SIP user. */
+function answererFromDialEvent(tracked, body) {
+  const m = String(body.DialBLegTo || "").trim().match(/^(?:sips?:)?([^@;>\s]+)/i);
+  if (!m) return null;
+  const user = m[1].toLowerCase();
+  const hit = (tracked.ringingAgents || []).find(a => String(a.sipUser || "").toLowerCase() === user);
+  return hit ? hit.agentId : null;
+}
+
 /** Dial callbackUrl: DialAnswer is the moment the B leg picked up. */
 async function handleDialEvent(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
@@ -468,7 +570,12 @@ async function handleDialEvent(req, res, url) {
   const event = String(body.Event || "");
   const action = String(body.DialAction || "").toLowerCase();
   const callUuid = body.CallUUID || body.DialALegUUID;
-  if ((event === "DialAnswer" || action === "answer") && trackedFor(callUuid, authId)) {
+  const tracked = (event === "DialAnswer" || action === "answer") && trackedFor(callUuid, authId);
+  if (tracked) {
+    if (tracked.type === "received") {
+      const answerer = answererFromDialEvent(tracked, body);
+      if (answerer) attributeInboundTo(callUuid, answerer, "DialBLegTo");
+    }
     markAnswered(callUuid, body.DialBLegUUID ? { bLegUuid: body.DialBLegUUID } : {});
   }
   sendXml(res, EMPTY_XML);
@@ -553,9 +660,12 @@ function answerInbound(body, res) {
     pushAgentEvent(agentId, { type: "inbound-routed", from: body.CallerName || caller || "unknown", callUuid });
   }
 
-  // Log the call in Zoho against the first ringing agent that belongs to a
-  // connected org.
+  // The call is tracked under the first ringing agent that belongs to a
+  // connected org: that user gets the ringing pop-up, and an unanswered call
+  // is logged as missed against them. When an agent answers, the log moves to
+  // the agent who answered (attributeInboundTo).
   const loggedAgent = agentIds.find(id => zohoPhoneBridge.orgForAgent(id));
+  const ordered = [match.agents.find(a => a.agentId === loggedAgent), ...match.agents.filter(a => a.agentId !== loggedAgent)].filter(Boolean);
   if (loggedAgent && callUuid && !zohoPhoneBridge.getTrackedCall(callUuid)) {
     const orgId = zohoPhoneBridge.orgForAgent(loggedAgent);
     const org = zohoPhoneBridge.getOrg(orgId);
@@ -563,6 +673,7 @@ function answerInbound(body, res) {
     const tracked = zohoPhoneBridge.trackCall(callUuid, {
       orgId, callId: `vobiz-in-${callUuid}`, agentId: loggedAgent, authId: match.authId, zohoUser,
       type: "received", from: caller, to: dialled, startedAtMs: Date.now(),
+      ringingAgents: ordered.map(a => ({ agentId: a.agentId, sipUser: a.sipUser })),
     });
     zohoPhoneBridge.notifyCall({
       orgId, type: "received", state: "ringing", callId: tracked.callId,
@@ -570,7 +681,6 @@ function answerInbound(body, res) {
     }).catch(err => console.error("[zoho-pb] inbound ringing notify failed:", err.message));
   }
 
-  const ordered = [match.agents.find(a => a.agentId === loggedAgent), ...match.agents.filter(a => a.agentId !== loggedAgent)].filter(Boolean);
   sendXml(res, vobizXmlInboundToAgents(ordered, match.authId || "", publicBaseUrl, match.number));
 }
 
@@ -892,7 +1002,7 @@ async function handleZohoPbClickToDial(req, res, url) {
   pendingBrowserCalls.set(agentId, {
     orgId, callId, agentId, authId: session.authId, zohoUser: effectiveZohoUser, type: "dialed", from, to, createdAtMs: Date.now(),
   });
-  pushAgentEvent(agentId, { type: "dial", to, callId });
+  pushToNewestTab(agentId, { type: "dial", to, callId }, { type: "dial-elsewhere", to });
   zohoPhoneBridge.notifyCall({
     orgId, type: "dialed", state: "ringing", callId, from, to, zohoUser: effectiveZohoUser, credentials: pbCredentials(),
   }).catch(err => console.error("[zoho-pb] ringing notify failed:", err.message));
@@ -1044,7 +1154,11 @@ async function handleVobizSession(req, res) {
   const { authId, authToken, callerId } = await readBody(req).catch(() => ({}));
   res.setHeader("Cache-Control", "no-store");
   try {
-    const out = await vobizAccounts.signIn({ agentId, authId, authToken, callerId, publicBaseUrl: getPublicBaseUrl() });
+    // A softphone tab of this agent is open: join its session instead of
+    // rotating the SIP password out from under it.
+    const out = await vobizAccounts.signIn({
+      agentId, authId, authToken, callerId, publicBaseUrl: getPublicBaseUrl(), reuseLiveSession: hasAgentListener(agentId),
+    });
     sendJson(res, 200, out);
   } catch (err) {
     console.warn(`[vobiz] sign-in for ${agentId} failed: ${err.message}`);
@@ -1098,6 +1212,19 @@ async function handleEnableInbound(req, res) {
   } catch (err) {
     sendJson(res, vobizErrorStatus(err), { error: err.message });
   }
+}
+
+/**
+ * The softphone accepted an inbound call: the call log goes to this agent.
+ * Fallback for when the Dial callback does not name the answering leg. An
+ * agent can only claim a call that rang them.
+ */
+async function handleInboundAnswered(req, res) {
+  const agentId = agentOr401(req, res);
+  if (!agentId) return;
+  const { callUuid } = await readBody(req).catch(() => ({}));
+  const ok = attributeInboundTo(String(callUuid || ""), agentId, "softphone");
+  sendJson(res, ok ? 200 : 404, { logged: ok });
 }
 
 function handleCallEvents(req, res, requestedId) {
@@ -1212,6 +1339,7 @@ const routes = {
   "POST /agent/vobiz-logout": wrap(handleVobizSignOut),
   "POST /agent/caller-id": wrap(handleCallerId),
   "POST /agent/enable-inbound": wrap(handleEnableInbound),
+  "POST /agent/inbound-answered": wrap(handleInboundAnswered),
   "GET /call-events": (req, res) => handleCallEvents(req, res, null),
 };
 
