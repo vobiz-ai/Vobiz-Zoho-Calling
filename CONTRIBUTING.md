@@ -13,8 +13,10 @@ Thanks for taking a look.
 
 ## Running it
 
-See the setup guide in `docs/`. You need a Vobiz account with a number and
-balance — every test places a real call and bills it.
+See [Quick start](README.md#quick-start) in the README. `npm test` in
+`backend/` is self-contained and needs no accounts. Trying a change end to end
+needs a Vobiz account with a number and balance, and a Zoho organization:
+every real call is billed.
 
 ## Reporting a bug
 
