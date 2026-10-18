@@ -3,21 +3,13 @@
 /**
  * Zoho PhoneBridge V3 integration.
  *
- * This is deliberately SEPARATE from the older Zoho CRM sync code in
- * server.js (syncCallToZoho / findZohoContactByPhone / handleZohoConnect).
- * That code drives the Sigma/Deluge custom-button experiment: one hardcoded
- * org, hardcoded `.in` domains, CRM scopes, a single shared token file. It
- * still works for what it does, so it is left alone.
- *
- * PhoneBridge is a different thing entirely, and none of those assumptions
- * survive it:
+ * What shapes it:
  *
  *   - It is a PUBLIC integration. Any Zoho customer who installs VoBiz from
  *     the Telephony Marketplace becomes a tenant here, so tokens are stored
  *     per-org, never globally.
  *   - Zoho runs ELEVEN datacentres (confirmed live against
- *     accounts.zoho.com/oauth/serverinfo, which is more than the seven their
- *     partner email mentions). A customer's data lives in exactly one, the
+ *     accounts.zoho.com/oauth/serverinfo). A customer's data lives in exactly one, the
  *     domains are not interchangeable, and Zoho explicitly forbids hardcoding
  *     them. Every domain in this file is resolved at runtime.
  *   - It is server-to-server. Zoho draws the entire UI; we expose a
@@ -33,7 +25,7 @@
  *   state       ringing | answered | missed | ended
  *   id          our call id (must be stable across all states of one call)
  *   from, to    E.164
- *   start_time  "yyyy-MM-dd HH:mm:ss" in GMT   (state=ended)
+ *   start_time  "yyyy-MM-dd HH:mm:ss" in GMT   (state=ended or missed)
  *   duration    seconds                        (state=ended)
  *   voiceuri    recording URL                  (state=ended, optional)
  *   zohouser    PhoneBridge user id            (optional)
@@ -41,19 +33,14 @@
  * Auth header is `Zoho-oauthtoken <token>`, NOT `Bearer`.
  */
 
-const fs = require("fs");
-const path = require("path");
-
 // The ONLY constant domain in this file, and Zoho documents it as the fixed
 // entry point: it is the directory that tells you every other domain.
 const SERVERINFO_URL = "https://accounts.zoho.com/oauth/serverinfo";
 
-// PhoneBridge scopes. Note these are NOT the ZohoCRM.* scopes the older
-// Deluge integration requests — asking for the wrong ones yields a token
+// PhoneBridge scopes. Note these are NOT the ZohoCRM.* scopes — asking for
+// those yields a token
 // that authenticates fine and then 401s on every PhoneBridge call.
 const PHONEBRIDGE_SCOPES = ["PhoneBridge.call.log", "PhoneBridge.zohoone.search"].join(",");
-
-const ORGS_FILE = path.join(__dirname, "zoho-orgs.json");
 
 // ---------------------------------------------------------------------------
 // Datacentre resolution
@@ -114,107 +101,55 @@ async function accountsDomainForLocation(location) {
 // Per-org token store
 // ---------------------------------------------------------------------------
 //
-// File-backed for now. This is the one part that must become a real database
-// before this serves actual customers: a JSON file cannot be written safely
-// by concurrent requests, and these tokens need encryption at rest since they
-// grant access to customers' CRM data. Everything else in this module is
-// already written as if the store were a database — swap the four functions
-// below and nothing else changes.
+// Encrypted at rest and keyed by org — see token-store.js. Every Zoho customer
+// that connects gets its own record under its own id, so a second customer
+// never displaces the first, and the file survives a restart as long as it is
+// on a persistent disk (DATA_DIR).
 
-function readOrgs() {
-  try {
-    return JSON.parse(fs.readFileSync(ORGS_FILE, "utf8"));
-  } catch {
-    return {};
-  }
-}
+const { createTokenStore } = require("./token-store");
+let store = createTokenStore();
 
-function writeOrgs(orgs) {
-  fs.writeFileSync(ORGS_FILE, JSON.stringify(orgs, null, 2));
+/** Tests point the module at a throwaway file. */
+function useStore(next) {
+  store = next;
 }
 
 function getOrg(orgId) {
-  return readOrgs()[orgId] || null;
+  return store.get(orgId);
 }
 
 function saveOrg(orgId, patch) {
-  const orgs = readOrgs();
-  orgs[orgId] = { ...(orgs[orgId] || {}), ...patch, orgId, updatedAt: new Date().toISOString() };
-  writeOrgs(orgs);
-  return orgs[orgId];
+  return store.put(orgId, patch);
 }
 
-/**
- * Rebuild a connected org from environment variables at boot.
- *
- * Render's free tier gives every restart a fresh filesystem, so zoho-orgs.json
- * does not survive a redeploy or a wake-from-sleep — which silently logs the
- * customer out and makes click-to-dial fail with "no org connected". The
- * refresh token is the only durable part of an OAuth grant, so keeping it in
- * config rather than on disk is what makes the connection outlive the
- * container.
- *
- * Only two values are needed: everything else is derived. The accounts domain
- * comes from serverinfo, and api_domain comes back on the first refresh — so
- * there is still nothing hardcoded here.
- *
- * This is a single-tenant shortcut appropriate to a development deployment.
- * Real multi-tenant operation needs the database this replaces.
- */
-async function bootstrapOrgFromEnv({ refreshToken, location, clientId, clientSecret }) {
-  if (!refreshToken || !location) return null;
-
-  const accountsDomain = await accountsDomainForLocation(location);
-
-  // Exchange the refresh token straight away: it both validates the token and
-  // tells us the api_domain, which we are not allowed to assume.
-  const params = new URLSearchParams({
-    grant_type: "refresh_token",
-    client_id: clientId,
-    client_secret: clientSecret,
-    refresh_token: refreshToken,
-  });
-  const res = await fetch(`${accountsDomain}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params.toString(),
-  });
-  const json = await res.json();
-  if (!json.access_token) {
-    throw new Error(`Bootstrap refresh failed: ${JSON.stringify(json)}`);
-  }
-
-  const orgId = `${location}:${json.api_domain}`;
-  saveOrg(orgId, {
-    location,
-    accountsDomain,
-    apiDomain: json.api_domain,
-    accessToken: json.access_token,
-    refreshToken,
-    expiresAt: Date.now() + (Number(json.expires_in) || 3600) * 1000,
-    scope: json.scope,
-    connectedAt: new Date().toISOString(),
-    restoredFromEnv: true,
-  });
-  console.log(`[zoho-pb] restored org ${orgId} from environment (location=${location}, api=${json.api_domain})`);
-  return orgId;
+function removeOrg(orgId) {
+  return store.remove(orgId);
 }
 
 function listOrgs() {
-  const orgs = readOrgs();
   // Never hand tokens back to a caller that only wants to know who is connected.
-  return Object.values(orgs).map(o => ({
+  return store.listPublic().map(o => ({
     orgId: o.orgId,
     location: o.location,
     accountsDomain: o.accountsDomain,
     apiDomain: o.apiDomain,
     scope: o.scope,
-    clickToDialRegistered: Boolean(o.clickToDialUri),
-    clickToDialUri: o.clickToDialUri || null,
+    clickToDialRegistered: Boolean(o.clickToDialUri || (o.registrations && o.registrations.length)),
+    registrations: (o.registrations || []).map(r => ({ agentId: r.agentId, zohoUser: r.zohoUser || null })),
+    agentMap: o.agentMap || {},
+    defaultAgentId: o.defaultAgentId || null,
     connectedAt: o.connectedAt,
     updatedAt: o.updatedAt,
     tokenExpiresAt: o.expiresAt ? new Date(o.expiresAt).toISOString() : null,
   }));
+}
+
+/** The org an agent belongs to, by mapping or as its default agent. */
+function orgForAgent(agentId) {
+  if (!agentId) return null;
+  const hit = store.listPublic().find(o =>
+    (o.agentMap && Object.prototype.hasOwnProperty.call(o.agentMap, agentId)) || o.defaultAgentId === agentId);
+  return hit ? hit.orgId : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,10 +321,17 @@ async function notifyCall({
   credentials,
 }) {
   const form = { type, state, id: callId, from, to };
-  if (state === "ended") {
+  // Each state sends exactly the parameters Zoho documents for it. `missed`
+  // REQUIRES start_time (Zoho's missed-call page marks it mandatory) — sending
+  // it bare is what produced the 400s once read as "Zoho rejects missed".
+  // `ringing` and `answered` must NOT carry start_time: Zoho answers
+  // INVALID_REQUEST to the extra parameter.
+  if (state === "ended" || state === "missed") {
     form.start_time = toZohoGmt(startedAtMs || Date.now());
-    form.duration = String(Math.max(0, Math.round(durationSec || 0)));
     if (voiceUri) form.voiceuri = voiceUri;
+  }
+  if (state === "ended") {
+    form.duration = String(Math.max(0, Math.round(durationSec || 0)));
   }
   if (zohoUser) form.zohouser = zohoUser;
 
@@ -436,9 +378,8 @@ async function notifyClickToDialError({ orgId, from, to, code, credentials }) {
  *
  * Until it is called, every other PhoneBridge endpoint — clicktodial,
  * callnotify, users — rejects the org with PBX_NOT_INTEGRATED, even though
- * Zoho's own admin screens report the provider as installed. That
- * contradiction cost us a day; the endpoint is not in the V3 developer docs
- * and only surfaced when Zoho's support team named it.
+ * Zoho's own admin screens report the provider as installed. The endpoint is
+ * not in the V3 developer docs.
  *
  * Takes no parameters: the org is identified by the access token.
  * Safe to call repeatedly — Zoho answers SUCCESS whether or not the
@@ -472,23 +413,33 @@ async function listZohoUsers({ orgId, credentials }) {
 }
 
 /** Tell Zoho where to send click-to-dial requests for this org. */
-async function registerClickToDial({ orgId, clickToDialUri, credentials, authorizationParam }) {
+/**
+ * Tell Zoho where to send click-to-dial requests for this org.
+ *
+ * With `zohoUser`, the registration is for that one Zoho user — Zoho's V3
+ * clicktodial docs: "To enable clicktodial for multiple users, call this API
+ * multiple times by passing the zohouser parameter". That is how one org gets
+ * one click-to-dial URI per agent.
+ */
+async function registerClickToDial({ orgId, clickToDialUri, credentials, authorizationParam, zohoUser }) {
   const form = { clicktodialuri: clickToDialUri };
+  if (zohoUser) form.zohouser = String(zohoUser);
   if (authorizationParam) form.authorizationparam = JSON.stringify(authorizationParam);
 
   const result = await phonebridgePost(orgId, "clicktodial", form, credentials);
   if (result.ok) {
-    saveOrg(orgId, { clickToDialUri });
-    console.log(`[zoho-pb] click-to-dial registered for org ${orgId} -> ${clickToDialUri}`);
+    if (!zohoUser) saveOrg(orgId, { clickToDialUri });
+    console.log(`[zoho-pb] click-to-dial registered for org ${orgId}${zohoUser ? ` user ${zohoUser}` : ""}`);
   } else {
     console.warn(`[zoho-pb] click-to-dial registration FAILED for org ${orgId}`, result.body);
   }
   return result;
 }
 
-async function unregisterClickToDial({ orgId, credentials }) {
-  const result = await phonebridgePost(orgId, "clicktodial", {}, credentials, "DELETE");
-  if (result.ok) saveOrg(orgId, { clickToDialUri: null });
+async function unregisterClickToDial({ orgId, credentials, zohoUser }) {
+  const form = zohoUser ? { zohouser: String(zohoUser) } : {};
+  const result = await phonebridgePost(orgId, "clicktodial", form, credentials, "DELETE");
+  if (result.ok && !zohoUser) saveOrg(orgId, { clickToDialUri: null });
   return result;
 }
 
@@ -541,8 +492,10 @@ module.exports = {
   getAccessToken,
   getOrg,
   saveOrg,
+  removeOrg,
   listOrgs,
-  bootstrapOrgFromEnv,
+  orgForAgent,
+  useStore,
   notifyCall,
   notifyClickToDialError,
   integrate,
