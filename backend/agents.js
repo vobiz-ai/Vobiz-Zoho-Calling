@@ -8,14 +8,16 @@
  *   {
  *     "priya": {
  *       "displayName": "Priya",
- *       "sipUser": "priya123@registrar.vobiz.ai",
- *       "sipPassword": "…",
- *       "callerId": "+9180XXXXXXXX",          optional, else VOBIZ_FROM_NUMBER
- *       "phoneNumber": "+9198XXXXXXXX",       optional, offline fallback only
- *       "zohoUser": "60083148163",            optional — explicit mapping
+ *       "zohoUser": "600001",                 optional — explicit mapping
  *       "email": "priya@example.com"          optional — matched to Zoho's roster
  *     }
  *   }
+ *
+ * That is all it holds: who the agent is and which Zoho user they are. No
+ * Vobiz credential, SIP login or phone number — the agent signs in to Vobiz
+ * from the softphone and the backend provisions their SIP endpoint
+ * (vobiz-accounts.js). Older files that still carry sipUser / sipPassword /
+ * callerId / phoneNumber are read, those fields ignored, and a warning logged.
  *
  * A missing or unreadable file is an empty roster, logged once — never an
  * exception thrown from inside a request handler, which is what used to take
@@ -27,6 +29,8 @@ const path = require("path");
 
 const agentsFile = () =>
   process.env.AGENTS_FILE || path.join(process.env.DATA_DIR || __dirname, "agents.json");
+
+const LEGACY_FIELDS = ["sipUser", "sipPassword", "callerId", "phoneNumber"];
 
 let cache = { file: null, mtimeMs: -1, agents: {} };
 let warned = false;
@@ -47,6 +51,10 @@ function loadAgents() {
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     const agents = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    const stale = Object.entries(agents).filter(([, v]) => v && LEGACY_FIELDS.some(f => f in v)).map(([k]) => k);
+    if (stale.length) {
+      console.warn(`[agents] ${file}: ${stale.join(", ")} still carry ${LEGACY_FIELDS.join("/")} — ignored; agents now sign in to Vobiz from the softphone. Remove those fields.`);
+    }
     cache = { file, mtimeMs: stat.mtimeMs, agents };
     warned = false;
     return agents;
