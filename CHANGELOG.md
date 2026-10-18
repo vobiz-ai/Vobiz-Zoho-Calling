@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Call logging, recording setting, one tab per agent
+
+- Inbound calls are logged in Zoho against the agent who answered, learned
+  from the Dial callback's `DialBLegTo` or, failing that, from the softphone
+  that accepted (`POST /agent/inbound-answered`). An unanswered inbound call is
+  still logged against the first ringing agent mapped to a Zoho user.
+- Numbers typed into the softphone are logged in Zoho (dialed → ringing →
+  answered → ended, with duration and recording) against the agent's Zoho
+  user. A pending click-to-dial now binds only to a call to the same number
+  placed within two minutes.
+- `OUTBOUND_RECORD` (default on): `false` stops recording outbound calls.
+- A second softphone tab signing in while one is open reuses the live SIP
+  password instead of rotating it, and Zoho click-to-dial goes to the most
+  recently opened tab only; the others are told where it went.
+- "Enable inbound calls" names the application the number moves off (ID as
+  fallback).
+- The softphone asks for the microphone right after sign-in and says clearly
+  when it is blocked.
+
 ### Any Vobiz account can sign in
 
 - Agents sign in to Vobiz from the softphone, with their own Auth ID + Auth

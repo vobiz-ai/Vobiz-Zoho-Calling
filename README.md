@@ -27,8 +27,8 @@ audio. You run this backend yourself, on a public HTTPS URL.
 
 - **Click-to-dial.** A Zoho user clicks a phone number in Zoho and the call is placed on Vobiz from their browser.
 - **Live call states.** Zoho's call bar shows the call as ringing, answered and ended as it happens.
-- **Call logging.** Outbound and inbound calls are logged in Zoho with start time, duration and direction, against the Zoho user who handled the call.
-- **Recordings.** Every outbound call is recorded, and the call log links to the recording. Inbound recording is optional.
+- **Call logging.** Outbound calls (clicked in Zoho or typed into the softphone) and inbound calls are logged in Zoho with start time, duration and direction, against the Zoho user who handled the call.
+- **Recordings.** Outbound calls are recorded by default and inbound recording is optional; the call log links to the recording.
 - **Inbound ringing.** A call to one of your Vobiz numbers rings every signed-in agent of that Vobiz account, with an **Accept / Decline** prompt and voicemail after 20 seconds.
 - **Caller ID choice.** Agents pick the caller ID from a dropdown of their Vobiz account's numbers.
 - **Many agents.** Each Zoho user is mapped to an agent, and click-to-dial is registered per user.
@@ -188,8 +188,11 @@ The agent enters the **Auth ID** (`MA_XXXXXXXX`) and **Auth Token** from Vobiz C
    is exactly that, and never changes any other application.
 3. Finds or creates one SIP endpoint for this agent in that account (alias `zoho-<agentId>`),
    gives it a fresh random SIP password, and attaches it to that application. A new password is
-   set on every sign-in.
-4. Starts the softphone with that SIP login.
+   set on every sign-in, unless the agent already has a softphone tab open (see
+   [More than one tab](#more-than-one-tab)).
+4. Starts the softphone with that SIP login, and asks the browser for the microphone straight away,
+   so the permission prompt never interrupts a call. If the microphone is blocked, the softphone
+   says **Microphone blocked — calls will have no audio**.
 
 **Caller ID.** The **Caller ID** dropdown lists the account's active, voice-enabled numbers. The
 agent's last choice is remembered while the backend runs; otherwise the first number is used. The
@@ -198,7 +201,7 @@ backend refuses a caller ID that is not on the account.
 **Enable inbound calls.** Choose a number in the dropdown and click **Enable inbound calls on this
 number**. This attaches the number to the **Vobiz-Zoho-PhoneBridge** application, so calls to it
 ring your agents. It moves the number off the application that answered it before, so the
-softphone asks first and names that application's ID. Numbers already routed to this integration
+softphone asks first and names that application (by name, or by ID if it has none). Numbers already routed to this integration
 show **· inbound on** in the dropdown. Nothing changes on a number until someone clicks the button.
 
 **Sign out of Vobiz** ends the Vobiz session for that agent.
@@ -254,10 +257,20 @@ Inbound calls to the caller ID number ring that SIP-direct agent.
 
 Click a phone number anywhere Zoho offers click-to-call. Zoho sends the number to your backend,
 the agent's softphone dials it, and Zoho's call bar follows the call. Agents can also type a number
-in **Number to call** in the softphone and click **Call**; those calls are not logged in Zoho.
+in **Number to call** in the softphone and click **Call**; those calls are logged in Zoho too,
+against the agent's Zoho user (an agent not mapped to a Zoho user is not logged).
 
 If the agent has no softphone tab open, or has not signed in to Vobiz there, no call is placed and
 Zoho is told the call failed with `AGENT_OFFLINE`.
+
+### More than one tab
+
+An agent can open the softphone in a second tab or browser. Signing in there while another tab is
+open joins that tab's session: the SIP password is not changed, so the first tab stays registered,
+and the new tab says so. Zoho click-to-dial goes to one tab only, the one opened (signed in) most
+recently; the other tabs show where the call went. Closing that tab sends the next click to the
+remaining one. Calls typed by hand work from any tab. With no tab open, signing in sets a new
+password as usual.
 
 ### Inbound calls
 
@@ -274,8 +287,13 @@ through PhoneBridge:
 
 - direction (dialled or received), from and to numbers,
 - start time and duration (billed duration from Vobiz when available),
-- the Zoho user: the user who clicked, for outbound; for inbound, the first ringing agent who is mapped to a connected Zoho organization,
+- the Zoho user: for outbound, the user who clicked (or the agent's own Zoho user for a typed number); for inbound, the agent who answered,
 - the recording link, when there is one.
+
+For an inbound call, the ringing pop-up goes to the first ringing agent mapped to a connected Zoho
+organization. When an agent answers, the log moves to that agent: the backend learns who answered
+from Vobiz's Dial callback (`DialBLegTo`), or else from the softphone that accepted the call. An
+inbound call nobody answers is logged as missed against that first mapped agent.
 
 An unanswered call is logged with duration 0. Set `ZOHO_PB_SEND_MISSED_STATE=true` to log it as a
 missed call instead. The log is written when the recording is ready, or 90 seconds after the call
@@ -283,7 +301,8 @@ ends if no recording arrives (`ZOHO_PB_RECORDING_GRACE_MS`).
 
 ### Recordings
 
-Every outbound call is recorded (MP3). Inbound calls are recorded when `INBOUND_RECORD=true`.
+Outbound calls are recorded (MP3) unless `OUTBOUND_RECORD=false`. Inbound calls are recorded when
+`INBOUND_RECORD=true`.
 Voicemail messages are always recorded. The call log links to a signed recording URL on your
 backend that expires after 30 days by default (`RECORDING_URL_TTL_DAYS`). When Zoho opens it, your
 backend fetches the audio from Vobiz and streams it back.
@@ -306,6 +325,7 @@ Set these in `backend/.env` or in your host's environment.
 | `AGENTS_FILE` | No | `DATA_DIR/agents.json` | Explicit path to `agents.json`. |
 | `ALLOWED_ORIGINS` | No | empty | Comma-separated browser origins allowed to call the backend cross-origin. The bundled softphone needs none. |
 | `REQUIRE_VOBIZ_SIGNATURE` | No | off | `true` refuses Vobiz webhooks whose signature does not verify. Off means verify and log a warning. |
+| `OUTBOUND_RECORD` | No | on | `false` stops recording outbound calls. The call log then has no recording link. |
 | `INBOUND_RECORD` | No | off | `true` records inbound calls. |
 | `ZOHO_PB_SEND_MISSED_STATE` | No | off | `true` logs unanswered calls as missed instead of ended with duration 0. |
 | `ZOHO_PB_RECORDING_GRACE_MS` | No | `90000` | How long after a call ends to wait for its recording before logging the call without one. |
@@ -332,7 +352,7 @@ Vobiz from the softphone.
 ## Security and privacy
 
 - **Your Auth Token never leaves the server and is never stored on disk.** It is checked with Vobiz, kept in the backend's memory, and never sent to a browser or written to logs.
-- **SIP passwords are not stored.** Each sign-in sets a new random password, hands it to that browser once, and forgets it. In SIP direct mode the password never reaches the backend.
+- **SIP passwords are not stored on disk.** A sign-in sets a new random password and hands it to that browser. The backend keeps it in memory only while that agent's Vobiz session lasts, so a second tab of the same agent can join it; signing out or a restart forgets it. In SIP direct mode the password never reaches the backend.
 - **What is on disk.** In `DATA_DIR`: `zoho-orgs.json` (Zoho tokens encrypted with AES-256-GCM, plus datacentre and agent mapping) and `vobiz-endpoints.json` (endpoint ID and SIP username per agent, no passwords). Both files are readable only by the backend's user.
 - **What the browser receives.** Its own agent session cookie (HttpOnly, SameSite=Strict, 12 hours), its own SIP login, and the list of the account's numbers. Never an Auth Token, a Zoho token or another agent's data.
 - **Every route needs a credential.** Admin routes need `ADMIN_TOKEN`. Agent routes need the agent session. Click-to-dial URLs registered with Zoho carry a signed token for their organization and agent. The Zoho sign-in callback accepts only a signed state that expires after 15 minutes.
@@ -359,11 +379,14 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | Clicking a number fails with `NO_CALLER_ID` | The Vobiz account has no active, voice-enabled number. | Add a number to the account and sign in again. |
 | Softphone shows **Not signed in** | The 12-hour agent session expired, or the link was never opened in this browser. | Open your sign-in link again. If it is rejected, ask the admin for a fresh one. |
 | **Vobiz did not accept those credentials** | Wrong Auth ID or Auth Token. | Copy both again from Vobiz Console → **API credentials**. |
-| **Registration failed** in the softphone | The SIP password changed, often because the agent signed in from a second tab or device. | Use one softphone tab per agent. Reload it and sign in again. |
+| **Registration failed** in the softphone | The SIP password changed: the agent signed in again after closing every tab, or the backend restarted. | Reload the tab and sign in again. A second tab opened while one is still open does not change the password. |
+| Clicking a number in Zoho dials in the wrong tab | Click-to-dial goes to the agent's most recently opened tab. | Use that tab, or close it so clicks go to the other one. |
+| Softphone says **Microphone blocked — calls will have no audio** | The browser refused the microphone at sign-in. | Allow the microphone for the backend's URL (the icon left of the address bar), then reload. |
 | Calls fail with **This line has no caller ID configured** | No caller ID is set for the agent. | Choose a caller ID in the dropdown, or sign in with an account that has a number. |
 | Inbound calls hear "no one is available" | No agent of the account that owns the number is signed in, or the backend restarted. | Have an agent sign in. Check the number shows **· inbound on**. |
 | Softphone says **Vobiz never rang this browser** | The call was routed to the agent but the browser was not reachable. | Reload the softphone and sign in again. |
-| No audio, or the call drops when it connects | Microphone permission is blocked or was asked for during the call. | Allow the microphone for the backend's URL permanently, then call again. |
+| No audio, or the call drops when it connects | Microphone permission is blocked. | Allow the microphone for the backend's URL permanently, reload, and call again. |
+| An inbound call is logged against the wrong agent | Neither Vobiz nor the softphone reported who answered (for example the tab lost its connection to the backend). | Check the backend log for `answered by`. Keep the softphone tab connected. |
 | Recording link in Zoho says the account must sign in again (503) | The backend restarted and no agent of that Vobiz account has signed in since. | Have any agent of that account sign in. |
 | Recording link returns 410 | The link expired. | Increase `RECORDING_URL_TTL_DAYS` for future calls. |
 
@@ -376,13 +399,11 @@ The backend log names every step of a call (`[zoho-pb]`, `[vobiz]`, `[backend]` 
 - **Sign in again after a restart.** Auth Tokens are not stored, so after the backend restarts every agent must reload the softphone and sign in to Vobiz again. Until one agent of an account has, that account's inbound calls are not answered by agents and its recording links return 503. A call in progress during a restart is not logged.
 - **Sign in again after a page reload.** The SIP password lives only in the page, so reloading the softphone signs in to Vobiz again.
 - **The softphone tab must stay open.** Click-to-dial fails with `AGENT_OFFLINE` without it.
-- **One softphone tab per agent.** Each sign-in sets a new SIP password, which disconnects any other tab of the same agent.
-- **Inbound rings everyone on the account.** Every signed-in agent of the Vobiz account rings at once. There is no per-number assignment, and the Zoho log for an inbound call is attributed to the first ringing agent mapped to a Zoho organization, not necessarily the one who answered.
-- **Outbound calls are always recorded.**
+- **Click-to-dial reaches one tab.** With several tabs open, Zoho clicks go to the most recently opened one.
+- **Inbound rings everyone on the account.** Every signed-in agent of the Vobiz account rings at once, and there is no per-number assignment. Zoho's ringing pop-up appears for the first ringing agent mapped to a Zoho organization; the call log goes to the agent who answered.
 - **SIP direct** has no caller ID list, no **Enable inbound calls**, no recording links in Zoho and no webhook signature checks.
 - **Agent sessions last 12 hours** and cannot be revoked one at a time; rotating `APP_SECRET` ends them all.
 - **No transfers and no ringing groups.**
-- Calls placed by typing a number in the softphone are not logged in Zoho.
 
 ## Development
 

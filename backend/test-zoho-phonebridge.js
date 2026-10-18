@@ -48,7 +48,7 @@ Object.assign(process.env, {
   ZOHO_PB_REDIRECT_URI: "https://example.test/oauth/zoho/callback",
   ZOHO_PB_RECORDING_GRACE_MS: "60000",
 });
-for (const k of ["VOBIZ_AUTH_ID", "VOBIZ_AUTH_TOKEN", "VOBIZ_FROM_NUMBER", "REQUIRE_VOBIZ_SIGNATURE", "CLICKTODIAL_WHEN_OFFLINE", "ZOHO_PB_SEND_MISSED_STATE", "RECORDING_URL_SECRET"]) delete process.env[k];
+for (const k of ["VOBIZ_AUTH_ID", "VOBIZ_AUTH_TOKEN", "VOBIZ_FROM_NUMBER", "REQUIRE_VOBIZ_SIGNATURE", "CLICKTODIAL_WHEN_OFFLINE", "ZOHO_PB_SEND_MISSED_STATE", "RECORDING_URL_SECRET", "OUTBOUND_RECORD", "INBOUND_RECORD"]) delete process.env[k];
 
 fs.writeFileSync(AGENTS_FILE, JSON.stringify({
   priya: { displayName: "Priya", zohoUser: "600001" },
@@ -165,7 +165,7 @@ function vobizMock(target, init) {
   if (method === "GET" && rest === "/numbers") {
     // Two pages for MA_TEST0001 (per_page honoured as 1 there), plus a
     // released and a voice-disabled number that must never be offered.
-    const all = acct.numbers.map(n => ({ id: `id-${n}`, account_id: authId, e164: n, status: "active", voice_enabled: true, application_id: OUR_APP_1 }))
+    const all = acct.numbers.map(n => ({ id: `id-${n}`, account_id: authId, e164: n, status: "active", voice_enabled: true, application_id: (acct.numberApps && acct.numberApps[n]) || OUR_APP_1 }))
       .concat(authId === "MA_TEST0001" ? [
         { id: "x1", e164: "+910000000098", status: "released", voice_enabled: true },
         { id: "x2", e164: "+910000000099", status: "active", voice_enabled: false },
@@ -618,12 +618,16 @@ async function testAnyAccount(orgId) {
   // Re-sign-in: same endpoint, fresh password, exact bind bodies on the wire.
   // Unbind it first, as if someone had changed it in the console.
   vobizState.MA_TEST0001.endpoints[e1.endpointId].app = null;
+  // +910000000002 answers on someone else's application, by name.
+  vobizState.MA_TEST0001.numberApps = { "+910000000002": "11111111111111111" };
   vobizCalls = [];
   const before = vobizState.MA_TEST0001.endpoints[e1.endpointId].password;
   const cookie = await agentCookie("priya");
   let r = await postJson("/agent/vobiz-session", ACCT1, { Cookie: cookie });
   let body = await r.json();
   check("signing in again remembers the agent's caller ID choice", body.callerId === "+910000000002", body.callerId);
+  const n2 = body.numbers.find(n => n.e164 === "+910000000002");
+  check("each number carries the name of the application answering it", n2 && n2.applicationName === "someone-elses" && n2.applicationId === "11111111111111111", body.numbers);
   check("signing in again reuses the endpoint", r.status === 200 && body.sipUser.startsWith(e1.username + "@") && Object.keys(vobizState.MA_TEST0001.endpoints).length === 1, body);
   check("with a fresh SIP password", body.sipPassword && body.sipPassword !== before && vobizState.MA_TEST0001.endpoints[e1.endpointId].password === body.sipPassword);
   const binds = vobizCalls.filter(c => c.method === "POST" && /\/Endpoint\/\d+\/$/.test(c.target) && /app/.test(c.body)).map(c => c.body);
@@ -668,7 +672,7 @@ async function testAnyAccount(orgId) {
   body = await r.json();
   const attach = vobizCalls.find(c => c.target.includes("/numbers/%2B910000000002/application"));
   check("Enable inbound attaches the DID to our application", r.status === 200 && attach && attach.body === '{"application_id":"43919358318796814"}', attach);
-  check("and reports which application it moved from", body.previousApplicationId === OUR_APP_1, body);
+  check("and reports which application it moved from, by name and ID", body.previousApplicationId === "11111111111111111" && body.previousApplicationName === "someone-elses", body);
   r = await postJson("/agent/enable-inbound", { number: "+910000000003" }, { Cookie: cookie });
   check("another account's number is refused", r.status === 400);
 
@@ -706,6 +710,146 @@ async function testAnyAccount(orgId) {
   check("an agent signed in but with no softphone open is still AGENT_OFFLINE", r.status === 409);
 
   check("no Auth Token appears in any HTTP response", !seenResponses.some(t => t.includes("tok-one-secret-value") || t.includes("tok-two-secret-value")));
+}
+
+
+const sipFrom = phone => `sip:${sipUserOf(phone)}@registrar.vobiz.ai`;
+
+async function testOutboundRecordSetting() {
+  console.log("\n[12] OUTBOUND_RECORD — the outbound recording setting");
+  const from = `sip:${vobizAccounts.sessionFor("priya").sipUser}@registrar.vobiz.ai`;
+  let xml = await (await post("/answer", { CallUUID: "rec-default", From: from, To: "919999900050" })).text();
+  check("by default the outbound call is recorded (<Record> before <Dial>)", /<Record recordSession="true"[^>]*\/>\s*<Dial/.test(xml), xml);
+  process.env.OUTBOUND_RECORD = "false";
+  xml = await (await post("/answer", { CallUUID: "rec-off", From: from, To: "919999900051" })).text();
+  check("OUTBOUND_RECORD=false dials without <Record>", !xml.includes("<Record") && /<Number>919999900051<\/Number>/.test(xml), xml);
+  process.env.OUTBOUND_RECORD = "true";
+  xml = await (await post("/answer", { CallUUID: "rec-on", From: from, To: "919999900052" })).text();
+  check("OUTBOUND_RECORD=true records", xml.includes("<Record recordSession"), xml);
+  delete process.env.OUTBOUND_RECORD;
+  for (const id of ["rec-default", "rec-off", "rec-on"]) pb.untrackCall(id);
+}
+
+async function testTabsAndManualDials(orgId, uris) {
+  console.log("\n[13] One tab per agent — shared SIP password, click-to-dial to the newest tab");
+  const tabA = await openSoftphone("priya", ACCT1);
+  await tick();
+  const epId = JSON.parse(fs.readFileSync(vobizAccounts.storeFile(), "utf8"))["MA_TEST0001:priya"].endpointId;
+  vobizCalls = [];
+  const tabB = await openSoftphone("priya", ACCT1);
+  check("a second tab's sign-in reuses the live SIP password", tabB.status === 200 && tabB.vobiz.sipPassword === tabA.vobiz.sipPassword && tabB.vobiz.reusedSession === true, { a: tabA.vobiz.reusedSession, b: tabB.vobiz.reusedSession });
+  check("and does not reset the endpoint's password at Vobiz", !vobizCalls.some(c => c.method === "POST" && /\/Endpoint\//.test(c.target) && c.body.includes("password")), vobizCalls.map(c => c.body));
+  check("the first tab's password is still the endpoint's", vobizState.MA_TEST0001.endpoints[epId].password === tabA.vobiz.sipPassword);
+  check("the reply to the second tab is still free of the Auth Token", !JSON.stringify(tabB.vobiz).includes("tok-"));
+  await tick();
+
+  let r = await post(uris["600001"], { tonumber: "+919999900061", zohouser: "600001" });
+  check("click-to-dial is accepted", r.status === 200);
+  await waitFor(() => tabB.events.some(e => e.type === "dial"));
+  await tick();
+  check("click-to-dial goes to the newest tab only", tabB.events.some(e => e.type === "dial" && e.to === "+919999900061") && !tabA.events.some(e => e.type === "dial"));
+  check("the older tab is told the call went to the other tab", tabA.events.some(e => e.type === "dial-elsewhere" && e.to === "+919999900061"), tabA.events);
+
+  console.log("\n[14] Manual dials are logged in Zoho");
+  // The pending click is for +919999900061; the agent types another number first.
+  received.length = 0;
+  let xml = await (await post("/answer", { CallUUID: "manual-1", From: sipFrom(tabB), To: "919999900077" })).text();
+  check("a typed number is dialled as usual", /<Number>919999900077<\/Number>/.test(xml), xml);
+  await waitFor(() => notifies().length >= 1);
+  let ring = notifies()[0];
+  check("Zoho hears dialed/ringing for the agent's Zoho user", ring && ring.fields.type === "dialed" && ring.fields.state === "ringing" && ring.fields.zohouser === "600001" && ring.fields.to === "+919999900077" && ring.fields.from === "+910000000002", ring && ring.fields);
+  check("under its own call id, not the pending click-to-dial's", ring && ring.fields.id === "vobiz-manual-manual-1", ring && ring.fields.id);
+  received.length = 0;
+  await post("/dial-event?agentId=priya&authId=MA_TEST0001", { Event: "DialAnswer", DialAction: "answer", CallUUID: "manual-1", DialBLegUUID: "bleg-manual-1" });
+  await waitFor(() => notifies().length >= 1);
+  check("then answered", notifies().some(n => n.fields.state === "answered" && n.fields.id === "vobiz-manual-manual-1"));
+  received.length = 0;
+  await post("/recording-ready?agentId=priya&authId=MA_TEST0001", { CallUUID: "manual-1", RecordingID: "rec-m1", RecordingDuration: "12" });
+  await waitFor(() => notifies().length >= 1);
+  const ended = notifies()[0];
+  check("and ended, with duration and recording, as the call log", ended && ended.fields.state === "ended" && ended.fields.id === "vobiz-manual-manual-1" && ended.fields.duration === "37" && Boolean(ended.fields.voiceuri) && ended.fields.zohouser === "600001", ended && ended.fields);
+
+  received.length = 0;
+  xml = await (await post("/answer", { CallUUID: "c2d-1", From: sipFrom(tabB), To: "919999900061" })).text();
+  await waitFor(() => notifies().length >= 1);
+  await tick();
+  check("the call to the clicked number still binds to the click-to-dial call id (no duplicate ringing)", pb.getTrackedCall("c2d-1") && /^vobiz-browser-/.test(pb.getTrackedCall("c2d-1").callId) && notifies().length === 0, { tracked: pb.getTrackedCall("c2d-1"), n: notifies().map(n => n.fields) });
+  pb.untrackCall("c2d-1");
+
+  received.length = 0;
+  await post("/answer", { CallUUID: "manual-sip", From: "sip:custsip01@registrar.vobiz.ai", To: "919999900078" });
+  await tick(150);
+  check("a manual dial by an agent with no Zoho user is not logged", notifies().length === 0 && !pb.getTrackedCall("manual-sip"), notifies().map(n => n.fields));
+
+  tabB.close();
+  await tick(200);
+  r = await post(uris["600001"], { tonumber: "+919999900062", zohouser: "600001" });
+  await waitFor(() => tabA.events.some(e => e.type === "dial"));
+  check("with the newest tab closed, click-to-dial reaches the remaining tab", tabA.events.some(e => e.type === "dial" && e.to === "+919999900062"));
+  tabA.close();
+  await tick(200);
+  const again = await postJson("/agent/vobiz-session", ACCT1, { Cookie: tabA.cookie });
+  const againBody = await again.json();
+  check("with no tab open, signing in rotates the SIP password as before", again.status === 200 && againBody.sipPassword !== tabA.vobiz.sipPassword && againBody.reusedSession === false);
+}
+
+async function testInboundAnswerer() {
+  console.log("\n[15] Inbound — the call log goes to the agent who answered");
+  const arjun = await openSoftphone("arjun", ACCT1);
+  const priyaUser = vobizAccounts.sessionFor("priya").sipUser;
+  const arjunUser = sipUserOf(arjun);
+  check("arjun signs in to MA_TEST0001 too", arjun.status === 200 && vobizAccounts.sessionFor("arjun").authId === "MA_TEST0001");
+
+  received.length = 0;
+  const xml = await (await post("/answer", { CallUUID: "in-ans-1", From: "919800000001", To: "910000000001" })).text();
+  check("the call rings both agents", xml.includes(`<User>sip:${priyaUser}@`) && xml.includes(`<User>sip:${arjunUser}@`), xml);
+  await waitFor(() => notifies().length >= 1);
+  check("ringing goes to the first mapped ringing agent (priya)", notifies()[0].fields.zohouser === "600001", notifies()[0].fields);
+  received.length = 0;
+  await post("/dial-event?agentId=priya&authId=MA_TEST0001&dir=in", { Event: "DialAnswer", DialAction: "answer", CallUUID: "in-ans-1", DialBLegUUID: "bleg-in-1", DialBLegTo: `sip:${arjunUser}@registrar.vobiz.ai` });
+  await waitFor(() => notifies().length >= 1);
+  check("answered is reported for the agent Vobiz names in DialBLegTo (arjun)", notifies()[0].fields.state === "answered" && notifies()[0].fields.zohouser === "600002", notifies()[0].fields);
+  received.length = 0;
+  await post("/recording-ready?agentId=priya&authId=MA_TEST0001&dir=in", { CallUUID: "in-ans-1", RecordingID: "rec-in-1" });
+  await waitFor(() => notifies().length >= 1);
+  check("the call log lands on arjun, who answered", notifies()[0].fields.state === "ended" && notifies()[0].fields.zohouser === "600002" && notifies()[0].fields.type === "received", notifies()[0].fields);
+
+  // No DialBLegTo: the softphone's own report decides.
+  await post("/answer", { CallUUID: "in-ans-2", From: "919800000002", To: "910000000001" });
+  await waitFor(() => Boolean(pb.getTrackedCall("in-ans-2")));
+  let r = await postJson("/agent/inbound-answered", { callUuid: "in-ans-2" }, { Cookie: await agentCookie("nomatch") });
+  check("an agent who was not rung cannot claim the call", r.status === 404);
+  r = await postJson("/agent/inbound-answered", { callUuid: "in-ans-2" });
+  check("claiming needs the agent session", r.status === 401);
+  r = await postJson("/agent/inbound-answered", { callUuid: "in-ans-2" }, { Cookie: arjun.cookie });
+  check("the softphone that accepted reports it", r.status === 200 && (await r.json()).logged === true);
+  r = await postJson("/agent/inbound-answered", { callUuid: "in-ans-2" }, { Cookie: await agentCookie("priya") });
+  check("a second claim by another agent does not move it", r.status === 404);
+  received.length = 0;
+  await post("/dial-event?agentId=priya&authId=MA_TEST0001&dir=in", { Event: "DialAnswer", DialAction: "answer", CallUUID: "in-ans-2", DialBLegUUID: "bleg-in-2" });
+  await waitFor(() => notifies().some(n => n.fields.state === "answered"));
+  await finalizeZohoPhoneBridgeCall("in-ans-2");
+  const end2 = notifies().find(n => n.fields.state === "ended");
+  check("the call log lands on the agent the softphone reported", end2 && end2.fields.zohouser === "600002", end2 && end2.fields);
+
+  // Nobody answers: logged against the first mapped ringing agent.
+  received.length = 0;
+  await post("/answer", { CallUUID: "in-ans-3", From: "919800000003", To: "910000000001" });
+  await waitFor(() => notifies().length >= 1);
+  received.length = 0;
+  await finalizeZohoPhoneBridgeCall("in-ans-3");
+  check("a missed inbound call is logged against the first mapped ringing agent", notifies()[0] && notifies()[0].fields.zohouser === "600001" && notifies()[0].fields.duration === "0", notifies()[0] && notifies()[0].fields);
+  arjun.close();
+}
+
+async function testMicrophonePrompt() {
+  console.log("\n[16] Softphone asks for the microphone at sign-in");
+  const html = await (await req("/agent-phone")).text();
+  const calls = html.match(/startPhone\([^)]*\);\s*requestMicrophone\(\);/g) || [];
+  check("both sign-in paths request the microphone right after starting the phone", calls.length === 2, calls);
+  check("the request stops the tracks again, keeping only the permission", /getUserMedia\(\{ audio: true[^}]*\}\);\s*stream\.getTracks\(\)\.forEach\(t => t\.stop\(\)\)/.test(html));
+  check("a denied microphone is named in the status", html.includes("Microphone blocked"));
+  check("Enable inbound names the application, ID as fallback", html.includes("info.applicationName, info.applicationId"));
 }
 
 async function testDisconnect(orgId) {
@@ -746,6 +890,10 @@ async function testNoAgentsFile() {
     await testInbound(orgId);
     await testCallbackContract();
     await testAnyAccount(orgId);
+    await testOutboundRecordSetting();
+    await testTabsAndManualDials(orgId, uris);
+    await testInboundAnswerer();
+    await testMicrophonePrompt();
     await testDisconnect(orgId);
     await testNoAgentsFile();
   } catch (err) {

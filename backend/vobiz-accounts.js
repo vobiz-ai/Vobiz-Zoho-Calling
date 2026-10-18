@@ -11,8 +11,12 @@
  *     this backend created it before, created otherwise. An application with
  *     any other answer_url is never touched.
  *   - one SIP endpoint per (authId, agentId), bound to that application, with a
- *     fresh random SIP password on every sign-in. Only {endpointId, username}
- *     is written to disk (vobiz-endpoints.json under DATA_DIR, mode 0600).
+ *     fresh random SIP password on every sign-in — except a sign-in from a
+ *     second tab while the agent already has a softphone tab open, which gets
+ *     the current password back so the first tab stays registered. That
+ *     password is held in memory only, for as long as the session lasts. Only
+ *     {endpointId, username} is written to disk (vobiz-endpoints.json under
+ *     DATA_DIR, mode 0600).
  *
  * Second mode, "SIP direct": the agent types the SIP username and password of
  * an endpoint they already have, plus a caller-ID number. The password never
@@ -134,12 +138,17 @@ const accounts = new Map();      // authId -> { authToken, numbers: [e164], appI
 const agentSessions = new Map(); // agentId -> { mode, authId, sipUser, endpointId, callerId, inboundNumber }
 const sipUsers = new Map();      // lower(sipUser) -> agentId
 const lastChoice = new Map();    // authId:agentId -> last caller ID picked
+// agentId -> { authId, password }: the live SIP password, so a second tab of
+// the same agent can join without rotating it. Kept apart from agentSessions,
+// whose entries are spread into webhook routing results.
+const livePasswords = new Map();
 
 function resetForTests() {
   accounts.clear();
   agentSessions.clear();
   sipUsers.clear();
   lastChoice.clear();
+  livePasswords.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -173,17 +182,27 @@ async function listNumbers(authId, authToken) {
   return out;
 }
 
-/** The application this backend created in this account, or a new one. */
+/**
+ * The application this backend created in this account, or a new one, plus
+ * the name of every application in the account (id -> name) so the softphone
+ * can say which application a number is moved off.
+ */
 async function findOrCreateApplication(authId, authToken, publicBaseUrl) {
   const answerUrl = `${publicBaseUrl}/answer`;
+  const names = {};
+  let found = null;
   for (let offset = 0, pages = 0; pages < 20; pages += 1, offset += 100) {
     const r = await vobiz(authId, authToken, "GET", `/Application/?limit=100&offset=${offset}`);
     if (!r.ok) throw new VobizApiError(`listing applications failed (${r.status})`, r.status);
     const objects = Array.isArray(r.json.objects) ? r.json.objects : [];
+    for (const a of objects) {
+      if (a && a.app_id != null && a.app_name) names[String(a.app_id)] = String(a.app_name);
+    }
     const hit = objects.find(a => a && a.answer_url === answerUrl && isDigits(a.app_id));
-    if (hit) return String(hit.app_id);
+    if (hit && !found) found = String(hit.app_id);
     if (!r.json.meta || !r.json.meta.next || objects.length === 0) break;
   }
+  if (found) return { appId: found, names };
   const body = JSON.stringify({
     app_name: APP_NAME,
     answer_url: answerUrl,
@@ -195,7 +214,8 @@ async function findOrCreateApplication(authId, authToken, publicBaseUrl) {
   const appId = r.json.app_id != null ? String(r.json.app_id) : "";
   if (!r.ok || !isDigits(appId)) throw new VobizApiError(`creating the application failed (${r.status})`, r.status || 502);
   console.log(`[vobiz] ${authId}: created application ${appId} -> ${answerUrl}`);
-  return appId;
+  names[appId] = APP_NAME;
+  return { appId, names };
 }
 
 const newPassword = () => crypto.randomBytes(18).toString("base64url").replace(/[^A-Za-z0-9]/g, "") + "Vz9";
@@ -297,10 +317,15 @@ async function provisionEndpoint(authId, authToken, agentId, appId) {
 
 /**
  * Verify the pair, provision app + endpoint, and record the session.
- * Returns what the browser needs — the SIP password included, exactly once.
- * The auth token is never part of the result.
+ * Returns what the browser needs — the SIP password included. The auth token
+ * is never part of the result.
+ *
+ * `reuseLiveSession` (the agent has a softphone tab open right now): when the
+ * agent already holds a session on this same account, its endpoint and SIP
+ * password are handed back unchanged instead of rotated, so the open tab is
+ * not knocked off its registration. The pair is still checked with Vobiz.
  */
-async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl }) {
+async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl, reuseLiveSession = false }) {
   authId = String(authId || "").trim();
   authToken = String(authToken || "").trim();
   if (!/^[A-Za-z0-9_]{4,64}$/.test(authId) || !authToken) throw new VobizAuthError("enter your Vobiz Auth ID and Auth Token");
@@ -308,10 +333,16 @@ async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl }) {
 
   const numberInfo = await listNumbers(authId, authToken);
   const numbers = numberInfo.map(n => n.e164);
-  const appId = await findOrCreateApplication(authId, authToken, publicBaseUrl);
-  accounts.set(authId, { authToken, numbers, numberInfo, appId });
+  const { appId, names: appNames } = await findOrCreateApplication(authId, authToken, publicBaseUrl);
+  accounts.set(authId, { authToken, numbers, numberInfo, appId, appNames });
 
-  const ep = await provisionEndpoint(authId, authToken, agentId, appId);
+  const current = agentSessions.get(agentId);
+  const live = livePasswords.get(agentId);
+  const reuse = Boolean(reuseLiveSession && current && current.mode === "account" && current.authId === authId &&
+    live && live.authId === authId && current.endpointId);
+  const ep = reuse
+    ? { endpointId: current.endpointId, username: current.sipUser, password: live.password, bound: true }
+    : await provisionEndpoint(authId, authToken, agentId, appId);
 
   signOut(agentId);
   // Default: the agent's last choice on this account, else the first number.
@@ -319,15 +350,22 @@ async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl }) {
   if (chosen) lastChoice.set(storeKey(authId, agentId), chosen);
   agentSessions.set(agentId, { mode: "account", authId, sipUser: ep.username, endpointId: ep.endpointId, callerId: chosen });
   sipUsers.set(ep.username.toLowerCase(), agentId);
-  console.log(`[vobiz] agent ${agentId} signed in to ${authId} as ${ep.username}`);
+  livePasswords.set(agentId, { authId, password: ep.password });
+  console.log(`[vobiz] agent ${agentId} signed in to ${authId} as ${ep.username}${reuse ? " (joined the open tab's session, password unchanged)" : ""}`);
   return {
     authId,
     sipUser: `${ep.username}@registrar.vobiz.ai`,
     sipPassword: ep.password,
-    numbers: numberInfo.map(n => ({ e164: n.e164, applicationId: n.applicationId, ours: n.applicationId === appId })),
+    numbers: numberInfo.map(n => ({
+      e164: n.e164,
+      applicationId: n.applicationId,
+      applicationName: (n.applicationId && appNames[n.applicationId]) || null,
+      ours: n.applicationId === appId,
+    })),
     applicationId: appId,
     callerId: chosen,
     applicationBound: ep.bound,
+    reusedSession: reuse,
   };
 }
 
@@ -380,6 +418,7 @@ function setCallerId(agentId, requested) {
 
 function signOut(agentId) {
   const s = agentSessions.get(agentId);
+  livePasswords.delete(agentId);
   if (!s) return;
   agentSessions.delete(agentId);
   if (sipUsers.get(s.sipUser.toLowerCase()) === agentId) sipUsers.delete(s.sipUser.toLowerCase());
@@ -454,7 +493,8 @@ async function attachNumber(agentId, number) {
   const previous = info ? info.applicationId : null;
   if (info) info.applicationId = acct.appId;
   console.log(`[vobiz] ${s.authId}: ${e164} now answers on application ${acct.appId}`);
-  return { number: e164, applicationId: acct.appId, previousApplicationId: previous };
+  const previousName = previous && acct.appNames ? acct.appNames[previous] || null : null;
+  return { number: e164, applicationId: acct.appId, previousApplicationId: previous, previousApplicationName: previousName };
 }
 
 /** Admin status — ids and counts only. */
