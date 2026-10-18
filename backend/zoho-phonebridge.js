@@ -3,21 +3,13 @@
 /**
  * Zoho PhoneBridge V3 integration.
  *
- * This is deliberately SEPARATE from the older Zoho CRM sync code in
- * server.js (syncCallToZoho / findZohoContactByPhone / handleZohoConnect).
- * That code drives the Sigma/Deluge custom-button experiment: one hardcoded
- * org, hardcoded `.in` domains, CRM scopes, a single shared token file. It
- * still works for what it does, so it is left alone.
- *
- * PhoneBridge is a different thing entirely, and none of those assumptions
- * survive it:
+ * What shapes it:
  *
  *   - It is a PUBLIC integration. Any Zoho customer who installs VoBiz from
  *     the Telephony Marketplace becomes a tenant here, so tokens are stored
  *     per-org, never globally.
  *   - Zoho runs ELEVEN datacentres (confirmed live against
- *     accounts.zoho.com/oauth/serverinfo, which is more than the seven their
- *     partner email mentions). A customer's data lives in exactly one, the
+ *     accounts.zoho.com/oauth/serverinfo). A customer's data lives in exactly one, the
  *     domains are not interchangeable, and Zoho explicitly forbids hardcoding
  *     them. Every domain in this file is resolved at runtime.
  *   - It is server-to-server. Zoho draws the entire UI; we expose a
@@ -45,8 +37,8 @@
 // entry point: it is the directory that tells you every other domain.
 const SERVERINFO_URL = "https://accounts.zoho.com/oauth/serverinfo";
 
-// PhoneBridge scopes. Note these are NOT the ZohoCRM.* scopes the older
-// Deluge integration requests — asking for the wrong ones yields a token
+// PhoneBridge scopes. Note these are NOT the ZohoCRM.* scopes — asking for
+// those yields a token
 // that authenticates fine and then 401s on every PhoneBridge call.
 const PHONEBRIDGE_SCOPES = ["PhoneBridge.call.log", "PhoneBridge.zohoone.search"].join(",");
 
@@ -386,9 +378,8 @@ async function notifyClickToDialError({ orgId, from, to, code, credentials }) {
  *
  * Until it is called, every other PhoneBridge endpoint — clicktodial,
  * callnotify, users — rejects the org with PBX_NOT_INTEGRATED, even though
- * Zoho's own admin screens report the provider as installed. That
- * contradiction cost us a day; the endpoint is not in the V3 developer docs
- * and only surfaced when Zoho's support team named it.
+ * Zoho's own admin screens report the provider as installed. The endpoint is
+ * not in the V3 developer docs.
  *
  * Takes no parameters: the org is identified by the access token.
  * Safe to call repeatedly — Zoho answers SUCCESS whether or not the

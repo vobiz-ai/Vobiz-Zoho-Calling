@@ -5,6 +5,37 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- `GET /agent/:id` no longer returns a SIP password unauthenticated. Agents
+  sign in with a per-agent key and can read only their own credentials.
+- Admin routes need `ADMIN_TOKEN`; click-to-dial needs the HMAC token in its
+  registered URI; the OAuth callback needs a signed `state`.
+- CORS is an allowlist instead of `*`.
+- Two unauthenticated requests that crashed the process are gone (a missing
+  `agents.json`, and the leftover `/zoho/connect`).
+
+### Changed
+
+- Zoho tokens are stored per org, encrypted with AES-256-GCM, under
+  `DATA_DIR`. Each connect creates its own org, so a second customer no longer
+  overwrites the first. `ZOHO_PB_REFRESH_TOKEN` / `ZOHO_PB_ORG_LOCATION` are
+  gone.
+- Zoho users are mapped to agents (`zohoUser` or `email` in `agents.json`) and
+  click-to-dial is registered per user.
+- With no softphone open, click-to-dial is refused with `AGENT_OFFLINE`
+  instead of placing a call that bridged the agent with `<Dial><User>`.
+- `/answer` finds the agent from the SIP username; the endpoint's application
+  no longer needs `?agentId=`.
+- Browser-originated calls report `answered` and carry their recording and
+  the customer leg's billed duration into the Zoho call log.
+- Inbound calls are logged to Zoho and ring for 20 seconds.
+- `missed` is sent with its mandatory `start_time`.
+- HubSpot, Salesforce, Deluge and Vapi leftovers removed.
+- Tests are hermetic.
+
 ## [1.0.0] — 2026-09-20
 
 First public release.

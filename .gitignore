@@ -7,3 +7,6 @@ node_modules/
 zoho-orgs.json
 agents.json
 dist/
+data/
+*.tmp
+package-lock.json

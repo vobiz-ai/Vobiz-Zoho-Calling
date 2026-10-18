@@ -5,7 +5,7 @@
 **Vobiz as a Zoho PhoneBridge telephony provider. Agents click a number anywhere in Zoho, the call is placed on Vobiz, and the call log lands on the Zoho record with its recording.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-e83c00.svg)](LICENSE)
-[![Node 18+](https://img.shields.io/badge/Node-18%2B-339933.svg)](https://nodejs.org)
+[![Node 20.12+](https://img.shields.io/badge/Node-20.12%2B-339933.svg)](https://nodejs.org)
 
 [Docs](https://www.vobiz.ai/docs/integrations/zoho) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
@@ -19,7 +19,8 @@
 | --- | --- |
 | **Click-to-dial** | A user clicks a number in Zoho and the call is placed. |
 | **Call states** | `ringing` / `answered` / `ended` reported as they happen. |
-| **Call logging** | Inbound and outbound written to the Zoho record. |
+| **Call logging** | Inbound and outbound written to the Zoho record, against the Zoho user who took the call. |
+| **Many agents** | Each Zoho user is mapped to a Vobiz agent; click-to-dial is registered per user. |
 | **Recordings** | Delivered to the call log behind a signed URL. |
 | **Failed dials** | Reported to Zoho as `clicktodialerror`. |
 | **Browser audio** | Outbound and inbound, with an Accept / Decline banner. |
@@ -42,8 +43,9 @@ back as the call progresses.
 
 Two consequences shape everything else:
 
-- **Multi-tenant.** Every Zoho customer who installs Vobiz is a tenant, so
-  credentials are stored per organization, never globally.
+- **Multi-tenant.** Every Zoho organization that connects is a tenant with its
+  own record. Tokens are encrypted at rest (AES-256-GCM) and kept on disk under
+  `DATA_DIR`, so they survive a restart.
 - **Multi-region.** Zoho runs **11 datacentres** and a customer's data lives in
   exactly one. Domains are resolved at runtime, never hardcoded.
 
@@ -71,25 +73,59 @@ specification asks for.
                                        ──► the log lands on the record
 ```
 
-`BROWSER_FIRST_DIAL=false` reverts to customer-first dialling, where Vobiz
-places the call to the customer over the REST API and bridges the agent in once
-they answer. The trade-off is audible: the customer hears a few seconds of
-ringback *after* answering.
+If the agent has no softphone open, the click is refused and Zoho is told
+`AGENT_OFFLINE`. Set `CLICKTODIAL_WHEN_OFFLINE=phone` to ring the agent's own
+phone (`phoneNumber` in `agents.json`) instead.
 
 Inbound rings the softphone with an **Accept / Decline** banner rather than
 answering automatically — Enter accepts, Escape declines. The agent has 20
 seconds before the caller falls through to voicemail. `INBOUND_RECORD=true`
 records inbound sessions.
 
-## Connecting a Zoho organization
+## Setup
+
+```bash
+cd backend
+cp .env.example .env            # fill in every value marked required
+cp agents.example.json agents.json
+npm test                        # hermetic: no network, no real accounts
+npm start
+```
+
+1. **Agents.** One entry per agent in `agents.json`: the Vobiz SIP endpoint
+   (`sipUser`, `sipPassword`), an optional `callerId`, and either `zohoUser`
+   (the Zoho PhoneBridge user id) or `email` (matched to the Zoho user's email).
+2. **Vobiz.** Create an application whose answer URL is
+   `<PUBLIC_BASE_URL>/answer` and attach every agent's endpoint to it. For
+   inbound, create an application with answer URL
+   `<PUBLIC_BASE_URL>/inbound-answer?agentId=<agent>` and attach your number.
+3. **Zoho OAuth client.** The client's redirect URI must be
+   `<PUBLIC_BASE_URL>/oauth/zoho/callback`, and `ZOHO_PB_REDIRECT_URI` must
+   match it exactly.
+4. **Connect an org** (admin). Sign in at `/admin/login` with `ADMIN_TOKEN`,
+   open `/zoho/phonebridge/connect`, approve in Zoho. The callback stores the
+   org and returns its `orgId`.
+5. **Register** (admin):
+   `curl -X POST $PUBLIC_BASE_URL/zoho/phonebridge/register -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{"orgId":"org_..."}'`
+   This activates the PBX, reads the org's Zoho users, pairs them with agents
+   and registers one click-to-dial URI per pair. The response lists anyone left
+   unmatched. Pass `"defaultAgentId"` to also register an org-level URI.
+6. **Agents sign in.** `GET /admin/agent-links` (admin) returns one link per
+   agent. Each agent opens theirs once; the key in the link is exchanged for a
+   session cookie and removed from the address bar.
+
+To remove an org: `POST /zoho/phonebridge/disconnect {"orgId": "..."}` (admin)
+deregisters click-to-dial, revokes the refresh token at Zoho and deletes our copy.
+
+## Connecting a Zoho organization — what happens
 
 ```
 1. GET accounts.zoho.com/oauth/serverinfo      → the 11 datacentre domains
-2. customer consents; redirect returns code + location
+2. customer consents; redirect returns code + location + our signed state
 3. POST accounts.zoho.<dc>/oauth/v2/token      → access + refresh, api_domain
 4. POST {api_domain}/phonebridge/v3/integrate  → activate the PBX
-5. POST {api_domain}/phonebridge/v3/clicktodial
-6. GET  {api_domain}/phonebridge/v3/users      → zohouser ids
+5. GET  {api_domain}/phonebridge/v3/users      → zohouser ids
+6. POST {api_domain}/phonebridge/v3/clicktodial  (once per mapped zohouser)
 ```
 
 > **Step 4 is not in Zoho's V3 documentation, and nothing works without it.**
@@ -120,19 +156,21 @@ response, never hardcoded. Bodies are form-encoded.
 | `POST callnotify` | Report a call state change | `type`, `state`, `id`, `from`, `to` |
 | `POST clicktodialerror` | Report a failed dial | `from`, `to`, `code` |
 
-### Call states, verified against the live API
+### Call states
 
-| state | Extra params | `type=dialed` | `type=received` |
-|---|---|---|---|
-| `ringing` | — | 200 | 200 |
-| `answered` | — | 200 | 200 |
-| `ended` | `start_time`, `duration`, `voiceuri` | 200 | 200 |
-| `missed` | with and without | **400** | **400** |
-| `busy` `rejected` `notavailable` `noanswer` | with and without | **400** | **400** |
+Each state takes exactly its documented parameters, and Zoho's live API
+enforces that in both directions:
 
-`missed` is documented by Zoho but rejected by their live API, as is every
-other terminal state except `ended`. A missed call is therefore logged as a
-zero-length completed call.
+| state | Extra params |
+|---|---|
+| `ringing` | none — `start_time` here is refused with `INVALID_REQUEST` |
+| `answered` | none — same |
+| `missed` | `start_time` (mandatory), optional `voiceuri` |
+| `ended` | `start_time`, `duration`, optional `voiceuri` |
+
+Unanswered calls are logged as `ended` with duration 0 by default. Set
+`ZOHO_PB_SEND_MISSED_STATE=true` to send `missed` instead; if Zoho refuses it,
+the call is logged as `ended` anyway.
 
 ### Timestamp format
 
@@ -143,13 +181,9 @@ start_time = "2026-09-15T12:00:00.000Z"  ← ISO 8601 is REJECTED
 
 ## Running the agent softphone
 
-```bash
-cd backend && npm start
-open "$PUBLIC_BASE_URL/agent-phone?agentId=test-agent"
-```
-
-Allow the microphone and wait for the green dot. The page is served from the
-backend so it shares an origin with the API and the SSE stream.
+Open the agent's sign-in link from `/admin/agent-links`, allow the microphone,
+and wait for the green dot. The page is served from the backend, so it shares
+an origin with the API and the event stream.
 
 ## Notes and gotchas
 
@@ -175,9 +209,9 @@ fetches `voiceuri` with no Vobiz credentials of its own, and comes back for the
 audio long after any agent session has gone. The HMAC signature is what
 authenticates the request; the fetch itself runs server-side.
 
-**Ephemeral filesystems wipe state.** The stored org does not survive a restart
-on hosts with an ephemeral disk. Set `ZOHO_PB_REFRESH_TOKEN` and
-`ZOHO_PB_ORG_LOCATION` and the backend rebuilds the org at boot.
+**Put `DATA_DIR` on a persistent disk.** Connected orgs live in
+`DATA_DIR/zoho-orgs.json`. On a host with an ephemeral filesystem, a restart
+without a persistent disk loses them and each org has to reconnect.
 
 **Ignore `sip_registered`.** It never flips to `"true"` for WebSocket
 registrations, on any endpoint — not for stock JsSIP, and not for the endpoint
@@ -195,17 +229,16 @@ nowhere near the cause:
 
 ## Known limitations
 
-- **A missed call is logged as a zero-length completed call**, because Zoho's
-  live API rejects every other terminal state.
-- **Single-tenant token storage.** Works for one org; real multi-tenant
-  operation needs a database with encryption at rest.
-- **No Zoho-user → Vobiz-agent mapping.** One registration serves one agent.
-  The `zohouser` ids are obtainable, so per-user addressing is buildable — it is
-  also the prerequisite for transfers and ringing groups.
-- **No transfers or ringing groups.**
+- **No transfers or ringing groups.** The per-user mapping they need is in
+  place.
+- **Agent sessions last 12 hours** and live in a signed cookie; there is no
+  per-agent revocation short of rotating `APP_SECRET`.
+- **Inbound rings one agent per number**, the one named in that number's
+  application answer URL.
+- **One process.** Call state in flight is held in memory, so run a single
+  instance; a restart mid-call loses that call's final log entry.
 
-This is a working integration, not a finished product. Read
-[SECURITY.md](SECURITY.md) before putting it in front of real customer traffic.
+Read [SECURITY.md](SECURITY.md) before deploying.
 
 ## Documentation
 

@@ -10,39 +10,44 @@ it. We will acknowledge your report and keep you updated.
 
 ## What this software protects, and what it does not
 
-Be clear-eyed about this before deploying. The list below is honest rather than
-reassuring.
-
 ### What is handled
 
-**The browser never holds your Vobiz Auth Token.** It is posted once at sign-in
-and exchanged for an opaque session token.
+**Every route that does something needs a credential.** Admin routes (connect,
+register, disconnect, status) need `ADMIN_TOKEN`. An agent's softphone gets an
+HttpOnly, SameSite=Strict session cookie in exchange for that agent's key, and
+can then read only its own SIP credentials. Click-to-dial URIs registered with
+Zoho carry an HMAC token for their org and agent; a request without it places
+no call. The OAuth callback accepts only a signed, expiring `state`.
 
-**Recording links carry no credentials.** They are HMAC-signed with a short
-expiry, and the audio is fetched server-side. A link that leaks grants nothing
-but that one recording, and only until it expires.
+**Zoho tokens are encrypted at rest.** AES-256-GCM with `TOKEN_ENCRYPTION_KEY`,
+bound to the org id, in a 0600 file under `DATA_DIR`. Listings never return a
+token. Disconnecting an org revokes its refresh token at Zoho.
 
-**Recording playback takes no caller-supplied URL.** An earlier generation of
-this pattern accepted a `url` parameter and fetched it with the account's Vobiz
-credentials attached — a credential-exfiltration primitive any web page could
-drive. Never reintroduce one.
+**The browser never holds the Vobiz Auth Token.** It stays on the server. The
+browser holds only its own agent's SIP endpoint password, after signing in.
 
-**CORS is an allowlist**, not `*`.
+**Recording links carry no credentials.** They are HMAC-signed and expire
+(30 days by default, `RECORDING_URL_TTL_DAYS`). The audio is fetched
+server-side, only from a vobiz.ai host, by recording id — there is no route
+that fetches a caller-supplied URL.
+
+**CORS is an allowlist** (`ALLOWED_ORIGINS`), empty by default. Never `*`.
+
+**Static files come from a fixed list.** No request path reaches the
+filesystem.
 
 ### What is not handled
 
-**The backend binds to a single Vobiz account.** Every agent who signs in shares
-one SIP endpoint. This is fine for a pilot and wrong for a real deployment.
+**Vobiz webhook signatures are verify-and-warn by default.** Set
+`REQUIRE_VOBIZ_SIGNATURE=true` once your logs show `signature ok` on a real
+call. Until then, anyone who can reach the webhook routes can send fake call
+events (they cannot place calls or read secrets through them).
 
-**There is no per-agent identity.** The agent id selects a label, not an
-identity, and nothing stops a signed-in user from asserting another.
+**Agent sessions cannot be revoked one at a time.** They expire after 12
+hours; rotating `APP_SECRET` ends all of them and invalidates every agent link
+and click-to-dial registration (re-run register).
 
-**Secrets live in `.env`.** There is no secret manager, no encryption at rest,
-and no rotation. Treat the host as sensitive.
+**Secrets live in environment variables.** Use your host's secret manager.
 
-**A quick tunnel is not production infrastructure.** Its hostname changes on
-every restart and it is publicly reachable while it is up.
-
-Deploying this as-is for real customer traffic needs, at minimum: an endpoint
-per agent, an identity store, a stable hostname, and secrets held somewhere
-better than a file.
+**No rate limiting.** Put the backend behind a proxy that rate-limits
+`/zoho/phonebridge/clicktodial` and `/agent-session`.

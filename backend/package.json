@@ -9,7 +9,7 @@
     "test": "node test-zoho-phonebridge.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.12"
   },
   "license": "MIT",
   "repository": {

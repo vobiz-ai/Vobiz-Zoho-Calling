@@ -142,7 +142,7 @@ function readBody(req) {
         try {
           return resolve(JSON.parse(raw));
         } catch {
-          // Zoho Deluge sends form data labelled JSON — fall through.
+          // Some clients send form data labelled JSON — fall through.
         }
       }
       resolve(Object.fromEntries(new URLSearchParams(raw)));
