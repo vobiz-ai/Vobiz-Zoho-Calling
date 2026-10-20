@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Integration baseline: one phone line per agent, every outcome logged, hardened callbacks, CI
+
+- **One phone line per agent.** Vobiz keeps one registration per SIP endpoint, so two tabs on one endpoint evict each other.
+  - Every sign-in now sets a new SIP password and hands it to that tab only. This replaces the earlier change below in which a second tab reused the live password; the backend no longer keeps any SIP password, even in memory.
+  - The agent's other tabs are told **Signed in in another tab**, stop their phone (after a call in progress ends) and offer to sign in again. Tabs are told apart by an id each one sends with its sign-in and its event stream.
+  - Click-to-dial goes to the tab holding the line. If that tab is closed, a click is `AGENT_OFFLINE`, never handed to a tab whose password no longer works.
+- **Every click-to-dial outcome reaches Zoho.** Before, a click that never became a call left Zoho's call bar ringing. Now it is closed as not connected (`ended`, 0 s, or `missed` with `ZOHO_PB_SEND_MISSED_STATE`) when:
+  - the softphone reports it could not place it (`POST /agent/call-failed`, sent on JsSIP `failed`, when not registered, or when the call would not start). An agent can only close their own waiting click; a click already bound to a Vobiz call is logged by that call's webhooks;
+  - a newer click replaces it;
+  - the agent signs out;
+  - nothing happens within `CLICK_TO_DIAL_TIMEOUT_MS` (new, default 2 minutes).
+
+  Zoho always gets `ringing` before the `ended` that closes a click. A clicked call refused at `/answer` for having no caller ID is closed too.
+- **Refused calls hear a message, never silence.** A refused `/answer` used to return a bare `<Hangup/>`. It now says the call cannot be connected (browser leg) or that no one is available (inbound).
+- **Callbacks trust only what is signed.** `/dial-result` took the agent from `?agentId=`, which the signature does not cover. It now works the agent out from the browser's SIP user or the tracked call. The nonce may also arrive as the plain `X-Vobiz-Signature-Nonce` header.
+- **Recordings are fetched only over HTTPS.** The audio URL must be `https://` on a vobiz.ai host before the account's credentials are sent with it.
+- **ICE gathering is capped.** The softphone sends its SDP at the first public (server-reflexive) candidate, or 2.5 s after the first candidate, on outbound calls and inbound answers. Before, a machine with extra network adapters could hold a call for about 40 s.
+- **`.gitignore`** now lists `vobiz-accounts.json`.
+- **CI** (`.github/workflows/ci.yml`): syntax checks of every backend file and the softphone's inline script, plus the tests, on Node 20.12 and 24; and a scan that fails on committed data files, keys, tokens, real-looking Auth IDs, Zoho client IDs, phone numbers and tunnel hosts.
+- Tests use obvious fake phone numbers only. Section [13] is rewritten for the new tab behaviour, and a new section [21] covers the above. Tests: 245 → 275 checks.
+
 ### Security: crash-proof requests, text-only caller data, signed webhooks, no master key for agents
 
 - **A malformed request can no longer stop the process.** Several requests needed no credentials at all to crash it, wiping every agent's session and every call in progress:

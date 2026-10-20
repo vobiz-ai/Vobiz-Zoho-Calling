@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Syntax and tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest version package.json allows (process.loadEnvFile needs
+        # 20.12), and the current LTS.
+        node: ["20.12", "24"]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check every backend file
+        run: for f in *.js; do node --check "$f" || exit 1; done
+
+      - name: Syntax check the softphone's inline script
+        run: |
+          node -e '
+            const fs = require("fs"), vm = require("vm");
+            const html = fs.readFileSync("public/agent-phone.html", "utf8");
+            const inline = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+            if (inline.length !== 1) { console.error(`expected one inline script, found ${inline.length}`); process.exit(1); }
+            new vm.Script(inline[0], { filename: "public/agent-phone.html" });
+            console.log("the inline script parses");
+          '
+
+      # Hermetic: a mock Zoho on localhost, Vobiz stubbed. Exits non-zero on
+      # any failed check.
+      - name: Tests
+        run: npm test
+
+  hygiene:
+    name: No secrets or real identifiers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan the tracked tree
+        run: |
+          fail=0
+          X=':!backend/public/jssip.min.js'
+
+          # Files that hold live data or secrets are never committed.
+          if git ls-files | grep -E '(^|/)\.env$|(^|/)agents\.json$|zoho-orgs\.json$|vobiz-endpoints\.json$|vobiz-accounts\.json$|(^|/)data/'; then
+            echo "::error::A data or secret file is tracked"; fail=1
+          fi
+
+          # Real Vobiz Auth IDs look like MA_ plus uppercase letters and digits.
+          # The placeholder MA_XXXXXXXX and the test fakes MA_TESTnnnn are allowed.
+          if git grep -noE 'MA_[A-Z0-9]{6,}' -- . "$X" | grep -vE ':(MA_XXXXXXXX|MA_TEST[0-9]{4})$'; then
+            echo "::error::A real-looking Vobiz Auth ID is present"; fail=1
+          fi
+
+          # Phone numbers. Allowed: the placeholder +91XXXXXXXXXX, and numbers
+          # that cannot be real because the national part starts with 0
+          # (+910000000001 and the like, used by the tests).
+          if git grep -noE '\+[1-9][0-9]{7,14}' -- . "$X" | grep -vE ':\+910[0-9]*$'; then
+            echo "::error::A real-looking phone number is present"; fail=1
+          fi
+          if git grep -noE '(^|[^0-9])91[6-9][0-9]{9}([^0-9]|$)' -- . "$X"; then
+            echo "::error::A real-looking Indian mobile number (without +) is present"; fail=1
+          fi
+
+          # Keys and tokens.
+          if git grep -nE -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -e '1000\.[0-9a-f]{32}\.[0-9a-f]{32}' \
+               -e 'AKIA[0-9A-Z]{16}' -e 'gh[pousr]_[A-Za-z0-9]{36}' -e 'xox[abpr]-[A-Za-z0-9-]{10,}' -- . "$X"; then
+            echo "::error::A private key or an access token is present"; fail=1
+          fi
+          if git grep -noE '1000\.[A-Z0-9]{20,}' -- . "$X" | grep -vE ':1000\.X+$'; then
+            echo "::error::A real-looking Zoho client ID is present"; fail=1
+          fi
+
+          # Quick-tunnel hosts are reassigned to strangers once they lapse.
+          if git grep -nE '[a-z0-9-]+\.(trycloudflare\.com|ngrok\.io|ngrok-free\.app|ngrok\.app|loca\.lt)' -- . "$X"; then
+            echo "::error::An ephemeral tunnel host is present"; fail=1
+          fi
+
+          exit $fail

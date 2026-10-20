@@ -15,7 +15,7 @@
  *   agent    /agent/me, /call-events,            vz_agent cookie
  *            /agent/vobiz-session, /agent/sip-session,
  *            /agent/caller-id, /agent/enable-inbound,
- *            /agent/inbound-answered
+ *            /agent/inbound-answered, /agent/call-failed
  *   admin    /zoho/phonebridge/{connect,complete,register,disconnect,status,debug},
  *            /admin/agent-links, /admin/vobiz-account,
  *            /admin/vobiz-account/disconnect     ADMIN_TOKEN
@@ -93,7 +93,9 @@ const outboundRecordEnabled = () => String(process.env.OUTBOUND_RECORD || "").tr
 
 // A click-to-dial handed to a softphone is bound to the next call that tab
 // places to the same number within this window; anything else is a manual dial.
-const PENDING_CLICK_TO_DIAL_MS = 2 * 60 * 1000;
+// A click that has not become a call by then is closed in Zoho as unanswered,
+// so its call bar never hangs on "ringing". CLICK_TO_DIAL_TIMEOUT_MS tunes it.
+const pendingClickWindowMs = () => Number(process.env.CLICK_TO_DIAL_TIMEOUT_MS) || 2 * 60 * 1000;
 
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -115,11 +117,16 @@ const callEventListeners = new Map(); // agentId -> Set<res>
 // CallUUID. Zoho needs one stable callId for the whole call, so the id is
 // minted at click time and bound to the real UUID when /answer fires.
 const pendingBrowserCalls = new Map();
+// callId -> the timer that closes that click if it never becomes a call.
+const pendingClickTimers = new Map();
+// A waiting click -> its `ringing` notification to Zoho. Closing the click
+// waits for it, so Zoho never gets `ended` before `ringing` and is left
+// showing a call that rings forever.
+const clickRingingSent = new WeakMap();
 
-function hasAgentListener(agentId) {
-  const listeners = callEventListeners.get(agentId);
-  return Boolean(listeners && listeners.size);
-}
+// agentId -> the id of the softphone tab that signed in last, which holds the
+// agent's phone line.
+const lineTabs = new Map();
 
 function pushAgentEvent(agentId, event) {
   const listeners = callEventListeners.get(agentId);
@@ -129,17 +136,48 @@ function pushAgentEvent(agentId, event) {
 }
 
 /**
- * Click-to-dial goes to ONE tab: the agent's most recently connected softphone
- * tab (a Set iterates in insertion order, so that is the last one). Any other
+ * Vobiz keeps one registration per endpoint, so an agent has one live
+ * softphone tab. When a tab signs in, every other open tab of that agent is
+ * told it was signed in elsewhere: it stops its phone and its event stream,
+ * and offers to sign in again there. Tabs are told apart by the id each one
+ * sends with its sign-in and its event stream.
+ */
+function tellOtherTabs(agentId, signedInTab) {
+  const listeners = callEventListeners.get(agentId);
+  if (!listeners) return;
+  const payload = `data: ${JSON.stringify({ type: "signed-in-elsewhere" })}\n\n`;
+  for (const res of listeners) if (!signedInTab || res.vobizTab !== signedInTab) res.write(payload);
+}
+
+/** A tab id from the softphone: short, plain, or nothing. */
+const tabIdOf = raw => (/^[A-Za-z0-9-]{8,64}$/.test(String(raw || "")) ? String(raw) : null);
+
+/**
+ * The event stream of the tab holding the agent's phone line — the tab that
+ * signed in last — or null while that tab is not connected. Every other tab
+ * of the agent was told it was signed in elsewhere, and its SIP password no
+ * longer works, so a call handed to it could never be placed. For a page that
+ * sends no tab id: the most recently connected stream (a Set iterates in
+ * insertion order).
+ */
+function lineTabStream(agentId) {
+  const listeners = callEventListeners.get(agentId);
+  if (!listeners || !listeners.size) return null;
+  const all = [...listeners];
+  const lineTab = lineTabs.get(agentId);
+  if (lineTab) return all.find(res => res.vobizTab === lineTab) || null;
+  return all[all.length - 1];
+}
+
+/**
+ * Click-to-dial goes to ONE tab, the one holding the phone line. Any other
  * open tab is told where the call went, so it is not a silent no-op there.
  */
-function pushToNewestTab(agentId, event, elsewhere) {
-  const listeners = callEventListeners.get(agentId);
-  if (!listeners || !listeners.size) return;
-  const all = [...listeners];
-  const newest = all[all.length - 1];
-  newest.write(`data: ${JSON.stringify(event)}\n\n`);
-  if (elsewhere) for (const res of all.slice(0, -1)) res.write(`data: ${JSON.stringify(elsewhere)}\n\n`);
+function pushToLineTab(agentId, event, elsewhere) {
+  const target = lineTabStream(agentId);
+  if (!target) return;
+  target.write(`data: ${JSON.stringify(event)}\n\n`);
+  if (elsewhere) for (const res of callEventListeners.get(agentId)) if (res !== target) res.write(`data: ${JSON.stringify(elsewhere)}\n\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -302,15 +340,13 @@ function webhookCandidates(body, url) {
  * SIP-direct agent's number, or about a call one of them is on. This backend
  * holds no Auth Token for those, so their signature cannot be checked.
  */
-function isSipDirectTraffic(body, url) {
+function isSipDirectTraffic(body) {
   const bySip = vobizAccounts.sessionForSipFrom(body.From || body.from);
   if (bySip) return bySip.mode === "sip";
   if (vobizAccounts.sipDirectAgentsForNumber(body.To || body.to).length) return true;
   const tracked = zohoPhoneBridge.getTrackedCall(callUuidOf(body));
-  if (tracked && !tracked.authId) return true;
-  const agentId = url.searchParams.get("agentId");
-  const session = agentId && vobizAccounts.sessionFor(agentId);
-  return Boolean(session && session.mode === "sip");
+  // Never the ?agentId= of a callback URL: the query string is not signed.
+  return Boolean(tracked && !tracked.authId);
 }
 
 // ---------------------------------------------------------------------------
@@ -328,11 +364,13 @@ function isSipDirectTraffic(body, url) {
  * PUBLIC_BASE_URL, since behind a proxy or tunnel the Host header is not what
  * Vobiz addressed. True when any of the four verifies with `authToken`.
  */
+// Each signature with the nonce headers it may come with, most specific first;
+// the plain X-Vobiz-Signature-Nonce is accepted as a last resort for each.
 const SIGNATURE_HEADERS = [
-  ["x-vobiz-signature-v3", ["x-vobiz-signature-v3-nonce"], "."],
-  ["x-vobiz-signature-ma-v3", ["x-vobiz-signature-ma-v3-nonce", "x-vobiz-signature-v3-nonce"], "."],
-  ["x-vobiz-signature-v2", ["x-vobiz-signature-v2-nonce"], ""],
-  ["x-vobiz-signature-ma-v2", ["x-vobiz-signature-ma-v2-nonce", "x-vobiz-signature-v2-nonce"], ""],
+  ["x-vobiz-signature-v3", ["x-vobiz-signature-v3-nonce", "x-vobiz-signature-nonce"], "."],
+  ["x-vobiz-signature-ma-v3", ["x-vobiz-signature-ma-v3-nonce", "x-vobiz-signature-v3-nonce", "x-vobiz-signature-nonce"], "."],
+  ["x-vobiz-signature-v2", ["x-vobiz-signature-v2-nonce", "x-vobiz-signature-nonce"], ""],
+  ["x-vobiz-signature-ma-v2", ["x-vobiz-signature-ma-v2-nonce", "x-vobiz-signature-v2-nonce", "x-vobiz-signature-nonce"], ""],
 ];
 
 function verifyVobizSignature(req, url, authToken) {
@@ -377,7 +415,7 @@ function authenticateWebhook(req, url, body) {
     console.warn(`[backend] ${url.pathname} signature missing or wrong — accepted (REQUIRE_VOBIZ_SIGNATURE=false)`);
     return { ok: true, authId: candidates[0] || null };
   }
-  if (!candidates.length && isSipDirectTraffic(body, url)) {
+  if (!candidates.length && isSipDirectTraffic(body)) {
     console.warn(`[backend] ${url.pathname} SIP-direct webhook accepted unverified — this backend holds no Auth Token for it`);
     return { ok: true, authId: null };
   }
@@ -495,11 +533,16 @@ async function streamRecording(res, authId, recordingId) {
   }
   const meta = await metaRes.json();
   const fileUrl = meta.recording_url;
-  // The file must come from Vobiz — never follow a URL to anywhere else with
-  // the account credentials attached.
+  // The file must come from Vobiz, over HTTPS — never follow a URL anywhere
+  // else, or in the clear, with the account credentials attached.
   let host = "";
-  try { host = new URL(fileUrl).hostname; } catch { /* fall through */ }
-  if (!host || !(host === "vobiz.ai" || host.endsWith(".vobiz.ai"))) {
+  let secure = false;
+  try {
+    const parsed = new URL(fileUrl);
+    host = parsed.hostname;
+    secure = parsed.protocol === "https:";
+  } catch { /* fall through */ }
+  if (!secure || !host || !(host === "vobiz.ai" || host.endsWith(".vobiz.ai"))) {
     res.writeHead(404, { "Content-Type": "text/plain" });
     return res.end("no recording file yet");
   }
@@ -525,7 +568,16 @@ async function streamRecording(res, authId, recordingId) {
 // Vobiz webhooks
 // ---------------------------------------------------------------------------
 
-const HANGUP_XML = `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`;
+// What a caller hears when a call cannot go through — never silence.
+const CANNOT_CONNECT_XML = `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>This call cannot be connected right now.</Speak><Hangup/></Response>`;
+const NOBODY_AVAILABLE_XML = `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>Sorry, no one is available to take your call right now. Please try again later.</Speak><Hangup/></Response>`;
+
+/**
+ * The reply to a refused /answer. Static and polite: it acts on nothing and
+ * reveals nothing, so it is safe to give an unverified request, and a real
+ * caller whose webhook could not be verified still hears a message.
+ */
+const refusedAnswerXml = body => (String(body.From || body.from || "").startsWith("sip:") ? CANNOT_CONNECT_XML : NOBODY_AVAILABLE_XML);
 
 /**
  * The answer_url of the application provisioned in each signed-in account.
@@ -538,7 +590,7 @@ const HANGUP_XML = `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></R
 async function handleAnswer(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
   const { ok, authId } = authenticateWebhook(req, url, body);
-  if (!ok) return sendXml(res, HANGUP_XML);
+  if (!ok) return sendXml(res, refusedAnswerXml(body));
 
   // Vobiz posts the end-of-call notification here when no hangup_url is set.
   // Acknowledge it; never answer it with call instructions.
@@ -553,13 +605,13 @@ async function handleAnswer(req, res, url) {
   const publicBaseUrl = getPublicBaseUrl();
   if (!session || !publicBaseUrl) {
     console.warn(`[backend] /answer — no signed-in agent for from=${from}; the agent must sign in to Vobiz from the softphone again`);
-    return sendXml(res, `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>This call cannot be connected right now.</Speak><Hangup/></Response>`);
+    return sendXml(res, CANNOT_CONNECT_XML);
   }
   // The signature names the account. A browser signed in on one account is
   // never dialled out for by a webhook another account's token signed.
   if (session.mode === "account" && session.authId !== authId) {
     console.warn(`[backend] /answer — ${session.agentId} is on ${session.authId}, but the webhook was signed for ${authId || "no account"}; refused`);
-    return sendXml(res, `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>This call cannot be connected right now.</Speak><Hangup/></Response>`);
+    return sendXml(res, CANNOT_CONNECT_XML);
   }
   const { agentId } = session;
   const callUuid = body.CallUUID || body.call_uuid || body.RequestUUID;
@@ -569,13 +621,15 @@ async function handleAnswer(req, res, url) {
   // number, placed soon after the click. Any other call is a number the agent
   // typed by hand, logged further down once the caller ID is known.
   let manualDial = false;
+  let boundClick = false;
   if (callUuid && !zohoPhoneBridge.getTrackedCall(callUuid)) {
     const pending = pendingBrowserCalls.get(agentId);
-    const fresh = pending && Date.now() - pending.createdAtMs < PENDING_CLICK_TO_DIAL_MS;
-    if (pending && !fresh) pendingBrowserCalls.delete(agentId);
+    const fresh = pending && Date.now() - pending.createdAtMs < pendingClickWindowMs();
+    if (pending && !fresh) closePendingClick(agentId, pending.callId, "it was not dialled in time");
     if (fresh && sameNumber(pending.to, customer)) {
-      pendingBrowserCalls.delete(agentId);
+      forgetPendingClick(agentId);
       zohoPhoneBridge.trackCall(callUuid, { ...pending, authId: session.authId, startedAtMs: Date.now() });
+      boundClick = true;
       console.log(`[zoho-pb] bound ${pending.callId} to CallUUID ${callUuid}`);
     } else {
       manualDial = true;
@@ -591,6 +645,9 @@ async function handleAnswer(req, res, url) {
     // Without callerId Vobiz derives it from the A leg — here a SIP username,
     // not a number — and never creates the customer leg.
     console.warn(`[backend] /answer — ${agentId} has no caller ID; their Vobiz account has no numbers`);
+    // No <Dial>, so no dial result will ever close the click in Zoho: close
+    // it now, as unanswered.
+    if (boundClick) finalizeZohoPhoneBridgeCall(callUuid).catch(err => console.error("[zoho-pb] closing an undialled call failed:", err.message));
     return sendXml(res, `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>This line has no caller ID configured.</Speak><Hangup/></Response>`);
   }
   if (manualDial) trackManualDial(callUuid, agentId, session, customer);
@@ -724,15 +781,20 @@ async function handleDialResult(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
   const { ok, authId } = authenticateWebhook(req, url, body);
   if (!ok) return sendXml(res, EMPTY_XML);
-  const agentId = url.searchParams.get("agentId");
   console.log(`[backend] dial finished — DialStatus=${body.DialStatus} DialHangupCause=${body.DialHangupCause}`);
+  const callUuid = body.CallUUID || body.DialALegUUID || body.RequestUUID;
+  // The agent comes from what this backend knows about the call — the
+  // browser's SIP user, or the tracked call — never from ?agentId=, which is
+  // not covered by the signature.
+  const bySip = vobizAccounts.sessionForSipFrom(body.From || body.from);
+  const tracked = zohoPhoneBridge.getTrackedCall(callUuid);
+  const agentId = (bySip && bySip.agentId) || (tracked && tracked.agentId) || null;
   const session = agentId && vobizAccounts.sessionFor(agentId);
   if (session && session.authId === authId) pushAgentEvent(agentId, { type: "call-ended", status: body.DialStatus });
 
   // Safety net: the recording webhook is the preferred place to close a call
   // (it carries the audio), but a call with no recording never produces one.
   // finalize is idempotent, so whichever arrives first wins.
-  const callUuid = body.CallUUID || body.DialALegUUID || body.RequestUUID;
   if (trackedFor(callUuid, authId)) {
     if (body.DialBLegUUID) zohoPhoneBridge.updateTrackedCall(callUuid, { bLegUuid: body.DialBLegUUID });
     setTimeout(() => {
@@ -767,7 +829,7 @@ async function handleRecordingReady(req, res, url) {
 async function handleInboundAnswer(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
   const { ok, authId } = authenticateWebhook(req, url, body);
-  if (!ok) return sendXml(res, HANGUP_XML);
+  if (!ok) return sendXml(res, refusedAnswerXml(body));
   if ((body.Event || "") === "Hangup") return sendXml(res, EMPTY_XML);
   return answerInbound(body, res, authId);
 }
@@ -797,7 +859,7 @@ function answerInbound(body, res, authId) {
   const publicBaseUrl = getPublicBaseUrl();
   if (!match || !match.agents.length || !publicBaseUrl) {
     console.warn(`[backend] inbound ${caller} -> ${dialled}: ${!match ? "no signed-in Vobiz account or SIP-direct agent owns this number" : "no agent of " + match.authId + " is signed in"} — hanging up politely`);
-    return sendXml(res, `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>Sorry, no one is available to take your call right now. Please try again later.</Speak><Hangup/></Response>`);
+    return sendXml(res, NOBODY_AVAILABLE_XML);
   }
   const agentIds = match.agents.map(a => a.agentId);
   console.log(`[backend] inbound call ${caller} -> ${dialled} (${match.authId || "SIP direct"}), ringing ${agentIds.join(", ")}`);
@@ -1138,8 +1200,8 @@ async function handleZohoPbClickToDial(req, res, url) {
 
   // The agent must have the softphone open AND be signed in to Vobiz there —
   // that sign-in is the only place this backend learns which Vobiz account
-  // and caller ID to use.
-  if (!session || !hasAgentListener(agentId)) {
+  // and caller ID to use — in the tab that holds the phone line.
+  if (!session || !lineTabStream(agentId)) {
     return failWith("AGENT_OFFLINE", 409, {
       status: "error",
       message: `agent '${agentId}' is not signed in to the softphone`,
@@ -1149,16 +1211,67 @@ async function handleZohoPbClickToDial(req, res, url) {
   if (!from) return failWith("NO_CALLER_ID", 409, { status: "error", message: "the agent's Vobiz account has no number to use as caller ID" });
 
   // Agent first: hand the number to the open softphone, which places the
-  // INVITE; /answer then dials the customer.
+  // INVITE; /answer then dials the customer. A click still waiting from
+  // before is closed first: only the newest one can become the call.
+  closePendingClick(agentId, null, "a newer click replaced it");
   const callId = `vobiz-browser-${crypto.randomUUID()}`;
-  pendingBrowserCalls.set(agentId, {
+  const pending = {
     orgId, callId, agentId, authId: session.authId, zohoUser: effectiveZohoUser, type: "dialed", from, to, createdAtMs: Date.now(),
-  });
-  pushToNewestTab(agentId, { type: "dial", to, callId }, { type: "dial-elsewhere", to });
-  zohoPhoneBridge.notifyCall({
+  };
+  pendingBrowserCalls.set(agentId, pending);
+  const timer = setTimeout(() => closePendingClick(agentId, callId, "the softphone never placed the call"), pendingClickWindowMs());
+  timer.unref();
+  pendingClickTimers.set(callId, timer);
+  clickRingingSent.set(pending, zohoPhoneBridge.notifyCall({
     orgId, type: "dialed", state: "ringing", callId, from, to, zohoUser: effectiveZohoUser, credentials: pbCredentials(),
-  }).catch(err => console.error("[zoho-pb] ringing notify failed:", err.message));
+  }).catch(err => console.error("[zoho-pb] ringing notify failed:", err.message)));
+  pushToLineTab(agentId, { type: "dial", to, callId }, { type: "dial-elsewhere", to });
   return sendJson(res, 200, { status: "success", code: "SUCCESS", callid: callId, dialedBy: "softphone" });
+}
+
+/** Drop the agent's waiting click and its timer, without telling Zoho anything. */
+function forgetPendingClick(agentId) {
+  const pending = pendingBrowserCalls.get(agentId);
+  if (!pending) return null;
+  pendingBrowserCalls.delete(agentId);
+  clearTimeout(pendingClickTimers.get(pending.callId));
+  pendingClickTimers.delete(pending.callId);
+  return pending;
+}
+
+/**
+ * A click-to-dial that never became a call — the softphone's call failed, a
+ * newer click replaced it, the agent signed out, or nothing happened within
+ * the window — is closed in Zoho as unanswered, so its call bar never stays on
+ * "ringing" and the attempt is still in the call log. Only the agent's waiting
+ * click is touched, and with `callId` only that one: a click already bound to a
+ * Vobiz call is closed by that call's own webhooks.
+ */
+function closePendingClick(agentId, callId, reason) {
+  const pending = pendingBrowserCalls.get(agentId);
+  if (!pending || (callId && pending.callId !== callId)) return false;
+  forgetPendingClick(agentId);
+  console.log(`[zoho-pb] ${pending.callId} closed unanswered — ${reason}`);
+  Promise.resolve(clickRingingSent.get(pending)).then(() => notifyUnanswered({
+    orgId: pending.orgId, type: pending.type, callId: pending.callId,
+    from: pending.from, to: pending.to, startedAtMs: pending.createdAtMs, voiceUri: null,
+    zohoUser: pending.zohoUser, credentials: pbCredentials(),
+  })).catch(err => console.error("[zoho-pb] closing an unanswered click failed:", err.message));
+  return true;
+}
+
+/**
+ * How Zoho is told a call was never answered: `missed` (with its mandatory
+ * start_time) when ZOHO_PB_SEND_MISSED_STATE is on and Zoho accepts it,
+ * otherwise `ended` with 0 seconds.
+ */
+async function notifyUnanswered(base) {
+  if (ZOHO_PB_SEND_MISSED_STATE) {
+    const missed = await zohoPhoneBridge.notifyCall({ ...base, state: "missed" });
+    if (missed.ok) return;
+    console.warn(`[zoho-pb] Zoho refused 'missed' for ${base.callId} — logging it as ended/0s instead`);
+  }
+  await zohoPhoneBridge.notifyCall({ ...base, state: "ended", durationSec: 0 });
 }
 
 /**
@@ -1188,12 +1301,8 @@ async function finalizeZohoPhoneBridgeCall(callUuid, { recordingId, durationSec 
     zohoUser: tracked.zohoUser, credentials: pbCredentials(),
   };
 
-  if (!answered && ZOHO_PB_SEND_MISSED_STATE) {
-    const missed = await zohoPhoneBridge.notifyCall({ ...base, state: "missed" });
-    if (missed.ok) return;
-    console.warn(`[zoho-pb] Zoho refused 'missed' for ${tracked.callId} — logging it as ended/0s instead`);
-  }
-  await zohoPhoneBridge.notifyCall({ ...base, state: "ended", durationSec: duration });
+  if (answered) await zohoPhoneBridge.notifyCall({ ...base, state: "ended", durationSec: duration });
+  else await notifyUnanswered(base);
   console.log(`[zoho-pb] finalized ${tracked.callId} — ${answered ? `${duration}s` : "unanswered"}${voiceUri ? " with recording" : ""}`);
 }
 
@@ -1313,10 +1422,22 @@ function vobizErrorStatus(err) {
 }
 
 /**
+ * The tab that just signed in now holds the agent's phone line. Vobiz keeps
+ * one registration per endpoint, so every other open tab of the agent is told
+ * it was signed in elsewhere and stops its phone.
+ */
+function takeLine(agentId, tabId) {
+  if (tabId) lineTabs.set(agentId, tabId);
+  else lineTabs.delete(agentId);
+  tellOtherTabs(agentId, tabId);
+}
+
+/**
  * Softphone sign-in to Vobiz, on the account an admin connected for this
  * agent: no Auth Token from the browser. Finds or creates this integration's
  * application in that account and the agent's endpoint, and returns the SIP
- * login with a fresh password.
+ * login with a fresh password — a new one on every sign-in, handed only to
+ * the tab that asked.
  *
  * A request that carries an Auth Token is the old sign-in, where the agent
  * typed the account's master key. It is refused unless ALLOW_AGENT_AUTH_TOKEN
@@ -1325,11 +1446,8 @@ function vobizErrorStatus(err) {
 async function handleVobizSession(req, res) {
   const agentId = agentOr401(req, res);
   if (!agentId) return;
-  const { authId, authToken, callerId } = await readBody(req).catch(() => ({}));
+  const { authId, authToken, callerId, tabId } = await readBody(req).catch(() => ({}));
   res.setHeader("Cache-Control", "no-store");
-  // A softphone tab of this agent is open: join its session instead of
-  // rotating the SIP password out from under it.
-  const reuseLiveSession = hasAgentListener(agentId);
   try {
     let out;
     if (authToken) {
@@ -1338,14 +1456,15 @@ async function handleVobizSession(req, res) {
           error: "Agents do not sign in with the account's Auth Token here. Ask your admin to connect the Vobiz account; then sign in without it.",
         });
       }
-      out = await vobizAccounts.signIn({ agentId, authId, authToken, callerId, publicBaseUrl: getPublicBaseUrl(), reuseLiveSession });
+      out = await vobizAccounts.signIn({ agentId, authId, authToken, callerId, publicBaseUrl: getPublicBaseUrl() });
     } else {
       const account = connectedAccountFor(agentId);
       if (!account) {
         return sendJson(res, 409, { error: "No Vobiz account is connected for you yet. Ask your admin to connect it." });
       }
-      out = await vobizAccounts.signInConnected({ agentId, authId: account, callerId, publicBaseUrl: getPublicBaseUrl(), reuseLiveSession });
+      out = await vobizAccounts.signInConnected({ agentId, authId: account, callerId, publicBaseUrl: getPublicBaseUrl() });
     }
+    takeLine(agentId, tabIdOf(tabId));
     sendJson(res, 200, out);
   } catch (err) {
     console.warn(`[vobiz] sign-in for ${agentId} failed: ${err.message}`);
@@ -1360,20 +1479,46 @@ async function handleVobizSession(req, res) {
 async function handleSipSession(req, res) {
   const agentId = agentOr401(req, res);
   if (!agentId) return;
-  const { sipUser, callerId } = await readBody(req).catch(() => ({}));
+  const { sipUser, callerId, tabId } = await readBody(req).catch(() => ({}));
   res.setHeader("Cache-Control", "no-store");
   try {
-    sendJson(res, 200, vobizAccounts.signInSipDirect({ agentId, sipUser, callerId }));
+    const out = vobizAccounts.signInSipDirect({ agentId, sipUser, callerId });
+    takeLine(agentId, tabIdOf(tabId));
+    sendJson(res, 200, out);
   } catch (err) {
     sendJson(res, vobizErrorStatus(err), { error: err.message });
   }
 }
 
+/** Sign the agent out of Vobiz; a click still waiting for them is closed in Zoho. */
+function signOutAgent(agentId) {
+  vobizAccounts.signOut(agentId);
+  lineTabs.delete(agentId);
+  closePendingClick(agentId, null, "the agent signed out");
+}
+
 async function handleVobizSignOut(req, res) {
   const agentId = agentOr401(req, res);
   if (!agentId) return;
-  vobizAccounts.signOut(agentId);
+  signOutAgent(agentId);
   sendJson(res, 200, { ok: true });
+}
+
+/**
+ * The softphone could not place a click-to-dial call: it was not registered,
+ * the call would not start, or JsSIP reported `failed` before Vobiz ever ran
+ * /answer. Closes that click in Zoho as unanswered. An agent can only close
+ * their own waiting click; anything already bound to a Vobiz call is logged
+ * from that call's webhooks instead, so a report for it changes nothing.
+ */
+async function handleCallFailed(req, res) {
+  const agentId = agentOr401(req, res);
+  if (!agentId) return;
+  const { callId, cause } = await readBody(req).catch(() => ({}));
+  const why = String(cause || "unknown").replace(/[^\w .,:'()/-]/g, "").slice(0, 60) || "unknown";
+  const closed = typeof callId === "string" && callId.length > 0 &&
+    closePendingClick(agentId, callId, `the softphone's call failed (${why})`);
+  sendJson(res, closed ? 200 : 404, { closed: Boolean(closed) });
 }
 
 async function handleCallerId(req, res) {
@@ -1414,9 +1559,11 @@ async function handleInboundAnswered(req, res) {
   sendJson(res, ok ? 200 : 404, { logged: ok });
 }
 
-function handleCallEvents(req, res, requestedId) {
+/** The agent's event stream. ?tab= names the softphone tab it belongs to. */
+function handleCallEvents(req, res, requestedId, url) {
   const agentId = auth.agentFromRequest(req);
   if (!agentId || (requestedId && requestedId !== agentId)) return sendJson(res, 401, { error: "not signed in" });
+  res.vobizTab = tabIdOf(url && url.searchParams.get("tab"));
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
   res.write(": connected\n\n");
   if (!callEventListeners.has(agentId)) callEventListeners.set(agentId, new Set());
@@ -1555,7 +1702,7 @@ const routes = {
   "POST /agent-session": wrap(handleAgentSession),
   "POST /agent-logout": (req, res) => {
     const agentId = auth.agentFromRequest(req);
-    if (agentId) vobizAccounts.signOut(agentId);
+    if (agentId) signOutAgent(agentId);
     sendJson(res, 200, { ok: true }, { "Set-Cookie": auth.clearAgentCookie() });
   },
   "POST /agent/vobiz-session": wrap(handleVobizSession),
@@ -1564,7 +1711,8 @@ const routes = {
   "POST /agent/caller-id": wrap(handleCallerId),
   "POST /agent/enable-inbound": wrap(handleEnableInbound),
   "POST /agent/inbound-answered": wrap(handleInboundAnswered),
-  "GET /call-events": (req, res) => handleCallEvents(req, res, null),
+  "POST /agent/call-failed": wrap(handleCallFailed),
+  "GET /call-events": (req, res, url) => handleCallEvents(req, res, null, url),
 };
 
 function dispatch(req, res) {
@@ -1591,7 +1739,7 @@ function dispatch(req, res) {
     const prefix = p.startsWith("/agent/") ? "/agent/" : "/call-events/";
     const id = decodeSegment(p.slice(prefix.length));
     if (id === null) return sendJson(res, 400, { error: "bad request" });
-    return prefix === "/agent/" ? handleAgentMe(req, res, id) : handleCallEvents(req, res, id);
+    return prefix === "/agent/" ? handleAgentMe(req, res, id) : handleCallEvents(req, res, id, url);
   }
 
   // Static files come from a fixed whitelist — no path from the request ever

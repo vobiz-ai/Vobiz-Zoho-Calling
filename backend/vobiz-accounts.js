@@ -20,12 +20,12 @@
  *     this backend created it before, created otherwise. An application with
  *     any other answer_url is never touched.
  *   - one SIP endpoint per (authId, agentId), bound to that application, with a
- *     fresh random SIP password on every sign-in — except a sign-in from a
- *     second tab while the agent already has a softphone tab open, which gets
- *     the current password back so the first tab stays registered. That
- *     password is held in memory only, for as long as the session lasts. Only
- *     {endpointId, username} is written to disk (vobiz-endpoints.json under
- *     DATA_DIR, mode 0600).
+ *     fresh random SIP password on EVERY sign-in, handed only to the browser
+ *     that signed in. Vobiz keeps one registration per endpoint, so a second
+ *     tab cannot share the line: signing in there rotates the password, and
+ *     server.js tells the older tab it was signed in elsewhere. The password
+ *     is never stored; only {endpointId, username} is written to disk
+ *     (vobiz-endpoints.json under DATA_DIR, mode 0600).
  *
  * Second mode, "SIP direct": the agent types the SIP username and password of
  * an endpoint they already have, plus a caller-ID number. The password never
@@ -151,10 +151,6 @@ const accounts = new Map();      // authId -> { authToken, numbers: [e164], appI
 const agentSessions = new Map(); // agentId -> { mode, authId, sipUser, endpointId, callerId, inboundNumber }
 const sipUsers = new Map();      // lower(sipUser) -> agentId
 const lastChoice = new Map();    // authId:agentId -> last caller ID picked
-// agentId -> { authId, password }: the live SIP password, so a second tab of
-// the same agent can join without rotating it. Kept apart from agentSessions,
-// whose entries are spread into webhook routing results.
-const livePasswords = new Map();
 
 // Accounts an admin connected: { authId -> { authToken (sealed), connectedAt } }.
 const connectedStore = createTokenStore({ fileName: "vobiz-accounts.json", secretFields: ["authToken"], idField: "authId" });
@@ -196,7 +192,6 @@ function resetForTests() {
   agentSessions.clear();
   sipUsers.clear();
   lastChoice.clear();
-  livePasswords.clear();
   connectedLoaded = false;
 }
 
@@ -367,14 +362,12 @@ async function provisionEndpoint(authId, authToken, agentId, appId) {
 /**
  * Verify the pair, provision app + endpoint, and record the session.
  * Returns what the browser needs — the SIP password included. The auth token
- * is never part of the result.
- *
- * `reuseLiveSession` (the agent has a softphone tab open right now): when the
- * agent already holds a session on this same account, its endpoint and SIP
- * password are handed back unchanged instead of rotated, so the open tab is
- * not knocked off its registration. The pair is still checked with Vobiz.
+ * is never part of the result. Every sign-in rotates the endpoint's SIP
+ * password, so a tab that signed in earlier can no longer register: Vobiz
+ * keeps one registration per endpoint, and two tabs on one would take it from
+ * each other.
  */
-async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl, reuseLiveSession = false }) {
+async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl }) {
   loadConnected();
   authId = String(authId || "").trim();
   authToken = String(authToken || "").trim();
@@ -387,13 +380,7 @@ async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl, reu
   const wasConnected = Boolean(accounts.get(authId) && accounts.get(authId).connected);
   accounts.set(authId, { authToken, numbers, numberInfo, appId, appNames, connected: wasConnected });
 
-  const current = agentSessions.get(agentId);
-  const live = livePasswords.get(agentId);
-  const reuse = Boolean(reuseLiveSession && current && current.mode === "account" && current.authId === authId &&
-    live && live.authId === authId && current.endpointId);
-  const ep = reuse
-    ? { endpointId: current.endpointId, username: current.sipUser, password: live.password, bound: true }
-    : await provisionEndpoint(authId, authToken, agentId, appId);
+  const ep = await provisionEndpoint(authId, authToken, agentId, appId);
 
   signOut(agentId);
   // Default: the agent's last choice on this account, else the first number.
@@ -401,8 +388,7 @@ async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl, reu
   if (chosen) lastChoice.set(storeKey(authId, agentId), chosen);
   agentSessions.set(agentId, { mode: "account", authId, sipUser: ep.username, endpointId: ep.endpointId, callerId: chosen });
   sipUsers.set(ep.username.toLowerCase(), agentId);
-  livePasswords.set(agentId, { authId, password: ep.password });
-  console.log(`[vobiz] agent ${agentId} signed in to ${authId} as ${ep.username}${reuse ? " (joined the open tab's session, password unchanged)" : ""}`);
+  console.log(`[vobiz] agent ${agentId} signed in to ${authId} as ${ep.username}`);
   return {
     authId,
     sipUser: `${ep.username}@registrar.vobiz.ai`,
@@ -416,7 +402,6 @@ async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl, reu
     applicationId: appId,
     callerId: chosen,
     applicationBound: ep.bound,
-    reusedSession: reuse,
   };
 }
 
@@ -426,11 +411,11 @@ async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl, reu
  * including the check with Vobiz, so a token revoked in the Vobiz Console
  * stops working here too.
  */
-async function signInConnected({ agentId, authId, callerId, publicBaseUrl, reuseLiveSession = false }) {
+async function signInConnected({ agentId, authId, callerId, publicBaseUrl }) {
   loadConnected();
   const acct = accounts.get(authId);
   if (!acct || !acct.connected) throw new VobizApiError("that Vobiz account is not connected on this backend — ask your admin", 409);
-  return signIn({ agentId, authId, authToken: acct.authToken, callerId, publicBaseUrl, reuseLiveSession });
+  return signIn({ agentId, authId, authToken: acct.authToken, callerId, publicBaseUrl });
 }
 
 /**
@@ -525,7 +510,6 @@ function setCallerId(agentId, requested) {
 
 function signOut(agentId) {
   const s = agentSessions.get(agentId);
-  livePasswords.delete(agentId);
   if (!s) return;
   agentSessions.delete(agentId);
   if (sipUsers.get(s.sipUser.toLowerCase()) === agentId) sipUsers.delete(s.sipUser.toLowerCase());

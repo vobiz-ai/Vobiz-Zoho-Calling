@@ -32,17 +32,21 @@ logged. Agents sign in from the softphone without it, on the account assigned to
 them (or the only connected one); they cannot pick another. A softphone that
 sends an Auth Token is refused unless `ALLOW_AGENT_AUTH_TOKEN=true`, which exists
 only for migrating an older deployment. The browser holds only its own SIP
-password, handed out on sign-in; on disk there is only `{endpointId, username}`
-per agent (0600). In SIP-direct mode the SIP password never reaches the backend
-at all.
+password, a new one on every sign-in, handed to that tab and kept nowhere else:
+the backend does not store it, on disk or in memory. A tab that signed in
+earlier can no longer register, and is told it was signed in elsewhere. On disk
+there is only `{endpointId, username}` per agent (0600). In SIP-direct mode the
+SIP password never reaches the backend at all.
 
 **Vobiz webhooks must be signed.** Every webhook is checked against the Auth
 Token of the account it belongs to (`X-Vobiz-Signature-V3`, `-V2`, or the
 parent-account `-MA-V3` / `-MA-V2`), and it then acts for that account only, so
 a webhook signed by one customer can never reach another customer's agents,
-calls or Zoho log. One that does not verify is refused.
-`REQUIRE_VOBIZ_SIGNATURE=false` turns this back into verify-and-warn, for
-debugging only.
+calls or Zoho log. One that does not verify is refused (a caller hears a short
+message, never silence). `REQUIRE_VOBIZ_SIGNATURE=false` turns this back into
+verify-and-warn, for debugging only. The signature does not cover the query
+string, so no handler takes an agent or an account from it: both come from the
+call itself (the browser's SIP user, the tracked call, the dialled number).
 
 **No request can stop the process.** Every route runs inside an error guard, and
 nothing that parses a request (paths, cookies) throws outside one. A malformed
@@ -61,13 +65,18 @@ registrar only.
 Auth ID is inside the HMAC, so a link cannot be pointed at another account.
 They are HMAC-signed and expire
 (30 days by default, `RECORDING_URL_TTL_DAYS`). The audio is fetched
-server-side, only from a vobiz.ai host, by recording id — there is no route
-that fetches a caller-supplied URL.
+server-side, only from a vobiz.ai host and only over HTTPS, by recording id —
+there is no route that fetches a caller-supplied URL.
 
 **CORS is an allowlist** (`ALLOWED_ORIGINS`), empty by default. Never `*`.
 
 **Static files come from a fixed list.** No request path reaches the
 filesystem.
+
+**CI refuses committed secrets.** Every pull request is scanned for data files
+(`.env`, `agents.json`, the stores under `DATA_DIR`), private keys and access
+tokens, real-looking Vobiz Auth IDs, Zoho client IDs and phone numbers, and
+quick-tunnel hosts. Tests use obvious fakes only.
 
 ### What is not handled
 
