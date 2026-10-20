@@ -339,6 +339,7 @@ Vobiz from the softphone.
 ## Deploying to production
 
 - **HTTPS only.** Serve `PUBLIC_BASE_URL` over HTTPS. If TLS ends at a proxy, make sure the proxy sends `X-Forwarded-Proto: https` so session cookies are marked `Secure`.
+- **Sharing a host with other services.** The backend can sit under a path prefix, for example `https://integrations.example.com/zoho`, with your proxy stripping `/zoho` before forwarding. Set `PUBLIC_BASE_URL` to the full prefixed URL. Session cookies are then scoped to `/zoho`, so other services on the same host never see them. The softphone and sign-in pages build their URLs from their own location. The OAuth redirect URI is whatever is registered on the Zoho client: if that is `<host>/oauth/zoho/callback` at the root, route that one path to this backend unchanged.
 - **Run exactly one instance.** Calls in progress, agent sessions and Vobiz Auth Tokens live in the process's memory. Two instances behind a load balancer will lose calls.
 - **Keep `DATA_DIR` on a persistent disk.** Connected Zoho organizations and agent endpoint IDs live there. On an ephemeral filesystem, every restart means reconnecting each organization.
 - **Keep secrets in your host's secret manager.** `APP_SECRET`, `TOKEN_ENCRYPTION_KEY`, `ADMIN_TOKEN` and the Zoho client secret. Rotating `APP_SECRET` signs out every agent, invalidates all agent sign-in links, click-to-dial registrations and (unless `RECORDING_URL_SECRET` is set) recording links. Re-run register after rotating it.

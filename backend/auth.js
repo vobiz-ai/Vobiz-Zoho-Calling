@@ -54,10 +54,25 @@ function parseCookies(header) {
   return out;
 }
 
+/**
+ * The path part of PUBLIC_BASE_URL, e.g. "/zoho" for
+ * https://integrations.example.com/zoho, or "/" at the root. Cookies are
+ * scoped to it, so several integrations behind one host, each under its own
+ * prefix, never see or overwrite each other's sessions.
+ */
+function cookiePathFor(publicBaseUrl) {
+  try {
+    return new URL(publicBaseUrl).pathname.replace(/\/+$/, "") || "/";
+  } catch {
+    return "/";
+  }
+}
+
 function createAuth({
   appSecret = process.env.APP_SECRET,
   adminToken = process.env.ADMIN_TOKEN,
   allowedOrigins = process.env.ALLOWED_ORIGINS,
+  publicBaseUrl = () => process.env.PUBLIC_BASE_URL,
 } = {}) {
   if (!appSecret || String(appSecret).length < 32) {
     throw new Error(
@@ -89,8 +104,9 @@ function createAuth({
     }
   }
 
+  const cookiePath = () => cookiePathFor(typeof publicBaseUrl === "function" ? publicBaseUrl() : publicBaseUrl);
   const cookie = (name, value, maxAgeMs, secure) =>
-    `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(maxAgeMs / 1000)}` +
+    `${name}=${encodeURIComponent(value)}; Path=${cookiePath()}; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(maxAgeMs / 1000)}` +
     (secure ? "; Secure" : "");
 
   const isHttps = req =>
@@ -106,7 +122,7 @@ function createAuth({
     agentCookie(req, agentId) {
       return cookie(AGENT_COOKIE, signedValue("agent-session", agentId, AGENT_SESSION_MS), AGENT_SESSION_MS, isHttps(req));
     },
-    clearAgentCookie: () => `${AGENT_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`,
+    clearAgentCookie: () => `${AGENT_COOKIE}=; Path=${cookiePath()}; HttpOnly; SameSite=Strict; Max-Age=0`,
     agentFromRequest(req) {
       return readSigned("agent-session", parseCookies(req.headers.cookie)[AGENT_COOKIE]);
     },
@@ -162,4 +178,4 @@ function createAuth({
   };
 }
 
-module.exports = { createAuth, parseCookies, safeEqual };
+module.exports = { cookiePathFor, createAuth, parseCookies, safeEqual };
