@@ -17,21 +17,29 @@
  *            /agent/caller-id, /agent/enable-inbound,
  *            /agent/inbound-answered
  *   admin    /zoho/phonebridge/{connect,complete,register,disconnect,status,debug},
- *            /admin/agent-links                  ADMIN_TOKEN
+ *            /admin/agent-links, /admin/vobiz-account,
+ *            /admin/vobiz-account/disconnect     ADMIN_TOKEN
  *   Zoho     /zoho/phonebridge/clicktodial        HMAC token in the registered URI
  *            /zoho/phonebridge/callback           signed OAuth state
  *            /zoho/phonebridge/recording          HMAC-signed, expiring link
  *   Vobiz    /answer, /hangup, /inbound-answer, /dial-event, /dial-result,
- *            /recording-ready                     X-Vobiz-Signature-V3, checked
- *                                                 with the token of the account
- *                                                 the webhook belongs to
+ *            /recording-ready                     X-Vobiz-Signature-V3 (or V2,
+ *                                                 MA-V3, MA-V2), REQUIRED by
+ *                                                 default, checked with the token
+ *                                                 of the account the webhook
+ *                                                 belongs to
  *
- * No Vobiz account is configured on the server. Each agent signs in to Vobiz
- * from the softphone, either with their own Auth ID and Auth Token (vobiz-
- * accounts.js verifies the pair and provisions that account's application and
- * the agent's SIP endpoint) or "SIP direct" with an existing endpoint's SIP
- * login and a caller ID. Webhooks are routed back to the right account by SIP username
- * (calls the browser placed) or by the dialled DID (inbound calls).
+ * No Vobiz account is configured in env. An admin connects each Vobiz account
+ * once (/admin/vobiz-account); its Auth Token is sealed on disk and never
+ * reaches an agent. Agents sign in from the softphone without it (vobiz-
+ * accounts.js provisions that account's application and the agent's SIP
+ * endpoint), or "SIP direct" with an existing endpoint's SIP login and a
+ * caller ID. Typing the Auth Token into the softphone is refused unless
+ * ALLOW_AGENT_AUTH_TOKEN=true. Webhooks are routed back to the account whose
+ * token verified their signature.
+ *
+ * No request input can stop the process: every route runs inside an error
+ * guard, and nothing that parses the request throws outside one.
  */
 
 const http = require("http");
@@ -88,6 +96,14 @@ const outboundRecordEnabled = () => String(process.env.OUTBOUND_RECORD || "").tr
 const PENDING_CLICK_TO_DIAL_MS = 2 * 60 * 1000;
 
 const MAX_BODY_BYTES = 64 * 1024;
+
+// Vobiz webhooks must carry a valid signature unless this is explicitly
+// "false" (the old verify-and-warn behaviour, for debugging a mismatch).
+const signatureRequired = () => String(process.env.REQUIRE_VOBIZ_SIGNATURE || "").trim().toLowerCase() !== "false";
+
+// The old sign-in, where an agent types the account's Auth Token into the
+// softphone. Off unless explicitly turned on for a migration.
+const agentTokenSignInAllowed = () => /^(1|true|yes)$/i.test(String(process.env.ALLOW_AGENT_AUTH_TOKEN || "").trim());
 
 // ---------------------------------------------------------------------------
 // Agent event stream
@@ -192,22 +208,109 @@ function toE164(raw) {
 
 const callUuidOf = body => body.CallUUID || body.call_uuid || body.DialALegUUID || body.ALegRequestUUID || body.RequestUUID || null;
 
+/** decodeURIComponent, but null instead of a throw on malformed %-encoding. */
+function decodeSegment(s) {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Which signed-in Vobiz account a webhook belongs to: the SIP username the
- * browser called from, the authId our own callback URLs carry, the tracked
- * call, or — for a PSTN call to a DID — the account that owns the number.
+ * The caller as the softphone shows it: the caller name when it is plain text
+ * (letters, digits, spaces and . , ' ( ) + _ -), otherwise the E.164 number.
+ * The name comes from the caller's side of the network, so nothing that could
+ * be markup is ever passed on.
  */
-function accountForWebhook(body, url) {
+function callerLabel(name, number) {
+  const n = String(name || "").trim();
+  if (/^[\p{L}\p{N} .,'()+_-]{1,40}$/u.test(n)) return n;
+  return /^\+\d{6,15}$/.test(number) ? number : "unknown";
+}
+
+/**
+ * A number Zoho asked us to dial: digits with an optional leading "+", once
+ * spaces, dashes, dots and brackets are dropped. Anything else — letters,
+ * markup — is not a phone number and is never handed to the softphone.
+ */
+function dialableNumber(raw) {
+  const v = String(raw || "").trim();
+  if (!/^\+?[\d\s().-]{3,32}$/.test(v)) return null;
+  const digits = v.replace(/\D/g, "");
+  if (digits.length < 3 || digits.length > 15) return null;
+  return (v.startsWith("+") ? "+" : "") + digits;
+}
+
+/**
+ * Content-Security-Policy for the softphone page: scripts only from this
+ * origin plus the page's own inline script, pinned by its SHA-256 (computed
+ * from the bytes being served, so it always matches them); network only to
+ * this backend and the Vobiz SIP registrar. Even if something did slip markup
+ * into the page, the browser would refuse to run it.
+ */
+function softphoneCsp(html) {
+  const inline = [...String(html).matchAll(/<script>([\s\S]*?)<\/script>/g)]
+    .map(m => `'sha256-${crypto.createHash("sha256").update(m[1], "utf8").digest("base64")}'`);
+  return [
+    "default-src 'none'",
+    `script-src 'self' ${inline.join(" ")}`.trim(),
+    "style-src 'unsafe-inline'",
+    "connect-src 'self' wss://registrar.vobiz.ai:5063",
+    "media-src 'self' blob: mediastream:",
+    "img-src 'self' data:",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "object-src 'none'",
+  ].join("; ");
+}
+
+/** The one place a failed request is answered and logged. */
+function failRequest(req, res, err) {
+  console.error(`[backend] ${req.method} ${String(req.url || "").split("?")[0]} failed:`, err);
+  if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+  else res.end();
+}
+
+/**
+ * Every account a webhook could belong to, most specific first: the account
+ * of the browser that placed the call (by SIP username), the account Vobiz
+ * names in ParentAuthID, the account of the call we are tracking, the account
+ * that owns the dialled number, and last the authId our own callback URLs
+ * carry. Only accounts whose token this backend holds are listed. Which one
+ * the webhook really belongs to is decided by whose token verifies its
+ * signature (authenticateWebhook) — never by a field an attacker controls.
+ */
+function webhookCandidates(body, url) {
+  const out = [];
+  const add = id => {
+    if (id && !out.includes(id) && vobizAccounts.knownAccount(id)) out.push(id);
+  };
   const bySip = vobizAccounts.sessionForSipFrom(body.From || body.from);
-  if (bySip) return bySip.authId;
-  const q = url.searchParams.get("authId");
-  if (q && vobizAccounts.knownAccount(q)) return q;
-  const parent = body.ParentAuthID || body.parentauthid;
-  if (parent && vobizAccounts.knownAccount(parent)) return parent;
+  if (bySip) add(bySip.authId);
+  add(body.ParentAuthID || body.parentauthid);
   const tracked = zohoPhoneBridge.getTrackedCall(callUuidOf(body));
-  if (tracked && tracked.authId) return tracked.authId;
+  if (tracked) add(tracked.authId);
   const byDid = vobizAccounts.accountForNumber(body.To || body.to);
-  return byDid ? byDid.authId : null;
+  if (byDid) add(byDid.authId);
+  add(url.searchParams.get("authId"));
+  return out;
+}
+
+/**
+ * A webhook for a SIP-direct agent: placed by a SIP-direct browser, to a
+ * SIP-direct agent's number, or about a call one of them is on. This backend
+ * holds no Auth Token for those, so their signature cannot be checked.
+ */
+function isSipDirectTraffic(body, url) {
+  const bySip = vobizAccounts.sessionForSipFrom(body.From || body.from);
+  if (bySip) return bySip.mode === "sip";
+  if (vobizAccounts.sipDirectAgentsForNumber(body.To || body.to).length) return true;
+  const tracked = zohoPhoneBridge.getTrackedCall(callUuidOf(body));
+  if (tracked && !tracked.authId) return true;
+  const agentId = url.searchParams.get("agentId");
+  const session = agentId && vobizAccounts.sessionFor(agentId);
+  return Boolean(session && session.mode === "sip");
 }
 
 // ---------------------------------------------------------------------------
@@ -215,45 +318,71 @@ function accountForWebhook(body, url) {
 // ---------------------------------------------------------------------------
 
 /**
- * X-Vobiz-Signature-V3 = base64(HMAC-SHA256(authToken, url + "." + nonce)),
- * V2 the same without the ".". The URL is the one Vobiz was handed, without
- * its query string — rebuilt from PUBLIC_BASE_URL, since behind a tunnel the
- * Host header is not what Vobiz addressed. The body is never covered.
+ * Vobiz signs every callback over the URL it was handed (query string
+ * stripped) and a random nonce, never over the body:
+ *   V3 = base64(HMAC-SHA256(authToken, url + "." + nonce))
+ *   V2 = base64(HMAC-SHA256(authToken, url + nonce))
+ * On a sub-account's callbacks it adds MA-V3 / MA-V2, the same signature made
+ * with the parent (main) account's token, so an account connected as the
+ * parent still verifies its sub-accounts' traffic. The URL is rebuilt from
+ * PUBLIC_BASE_URL, since behind a proxy or tunnel the Host header is not what
+ * Vobiz addressed. True when any of the four verifies with `authToken`.
  */
+const SIGNATURE_HEADERS = [
+  ["x-vobiz-signature-v3", ["x-vobiz-signature-v3-nonce"], "."],
+  ["x-vobiz-signature-ma-v3", ["x-vobiz-signature-ma-v3-nonce", "x-vobiz-signature-v3-nonce"], "."],
+  ["x-vobiz-signature-v2", ["x-vobiz-signature-v2-nonce"], ""],
+  ["x-vobiz-signature-ma-v2", ["x-vobiz-signature-ma-v2-nonce", "x-vobiz-signature-v2-nonce"], ""],
+];
+
 function verifyVobizSignature(req, url, authToken) {
-  const v3 = req.headers["x-vobiz-signature-v3"];
-  const v2 = req.headers["x-vobiz-signature-v2"];
-  const nonce = req.headers["x-vobiz-signature-v3-nonce"] || req.headers["x-vobiz-signature-v2-nonce"];
   const base = getPublicBaseUrl();
-  if (!authToken || !base || !nonce || !(v3 || v2)) return false;
+  if (!authToken || !base) return false;
   const signed = `${base}${url.pathname}`;
-  const expected = v3
-    ? crypto.createHmac("sha256", authToken).update(`${signed}.${nonce}`).digest("base64")
-    : crypto.createHmac("sha256", authToken).update(`${signed}${nonce}`).digest("base64");
-  const a = Buffer.from(String(v3 || v2));
-  const b = Buffer.from(expected);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  return SIGNATURE_HEADERS.some(([sigHeader, nonceHeaders, sep]) => {
+    const sig = req.headers[sigHeader];
+    const nonce = nonceHeaders.map(h => req.headers[h]).find(Boolean);
+    if (!sig || !nonce) return false;
+    const expected = crypto.createHmac("sha256", authToken).update(`${signed}${sep}${nonce}`).digest("base64");
+    const a = Buffer.from(String(sig));
+    const b = Buffer.from(expected);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
 }
 
 /**
- * Checked with the token of the account the webhook belongs to. Default:
- * verify and warn — a webhook for an account nobody has signed in to since the
- * last restart cannot be verified and is treated like a bad signature.
- * REQUIRE_VOBIZ_SIGNATURE=true refuses unsigned or mis-signed webhooks — turn
- * it on once the logs show "signature ok" on a real call through your
- * PUBLIC_BASE_URL.
+ * Decide whether a Vobiz webhook may act, and for which account.
+ *
+ * The account is the candidate whose token verifies the signature. Handlers
+ * act for that account only, so a webhook signed with one customer's token
+ * can never reach another customer's agents, calls or Zoho log, whatever its
+ * body or query string say.
+ *
+ * Refused, by default, when no candidate's token verifies it. Two exceptions:
+ *   - SIP-direct traffic for which this backend holds no token at all is
+ *     accepted unverified, because there is nothing to verify it with — the
+ *     README says so, and connecting that account as admin makes it checked;
+ *   - REQUIRE_VOBIZ_SIGNATURE=false accepts everything with a warning, the
+ *     old behaviour, for debugging a signature mismatch.
  */
-function vobizWebhookAllowed(req, url, authId) {
-  if (verifyVobizSignature(req, url, vobizAccounts.tokenFor(authId))) {
-    console.log(`[backend] ${url.pathname} signature ok (${authId})`);
-    return true;
+function authenticateWebhook(req, url, body) {
+  const candidates = webhookCandidates(body, url);
+  for (const authId of candidates) {
+    if (verifyVobizSignature(req, url, vobizAccounts.tokenFor(authId))) {
+      console.log(`[backend] ${url.pathname} signature ok (${authId})`);
+      return { ok: true, authId };
+    }
   }
-  if (process.env.REQUIRE_VOBIZ_SIGNATURE === "true") {
-    console.warn(`[backend] ${url.pathname} signature missing or wrong — refused (REQUIRE_VOBIZ_SIGNATURE=true)`);
-    return false;
+  if (!signatureRequired()) {
+    console.warn(`[backend] ${url.pathname} signature missing or wrong — accepted (REQUIRE_VOBIZ_SIGNATURE=false)`);
+    return { ok: true, authId: candidates[0] || null };
   }
-  console.warn(`[backend] ${url.pathname} signature missing or wrong — accepted (set REQUIRE_VOBIZ_SIGNATURE=true to refuse)`);
-  return true;
+  if (!candidates.length && isSipDirectTraffic(body, url)) {
+    console.warn(`[backend] ${url.pathname} SIP-direct webhook accepted unverified — this backend holds no Auth Token for it`);
+    return { ok: true, authId: null };
+  }
+  console.warn(`[backend] ${url.pathname} signature missing or wrong — refused (${candidates.length ? `checked against ${candidates.join(", ")}` : "no connected or signed-in Vobiz account to check it against"})`);
+  return { ok: false, authId: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -408,8 +537,8 @@ const HANGUP_XML = `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></R
  */
 async function handleAnswer(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
-  const authId = accountForWebhook(body, url);
-  if (!vobizWebhookAllowed(req, url, authId)) return sendXml(res, HANGUP_XML);
+  const { ok, authId } = authenticateWebhook(req, url, body);
+  if (!ok) return sendXml(res, HANGUP_XML);
 
   // Vobiz posts the end-of-call notification here when no hangup_url is set.
   // Acknowledge it; never answer it with call instructions.
@@ -418,12 +547,18 @@ async function handleAnswer(req, res, url) {
   const from = String(body.From || body.from || "");
   const routeType = String(body.RouteType || body.routetype || "").toLowerCase();
   const browserLeg = from.startsWith("sip:") || routeType === "sip";
-  if (!browserLeg) return answerInbound(body, res);
+  if (!browserLeg) return answerInbound(body, res, authId);
 
   const session = vobizAccounts.sessionForSipFrom(from);
   const publicBaseUrl = getPublicBaseUrl();
   if (!session || !publicBaseUrl) {
     console.warn(`[backend] /answer — no signed-in agent for from=${from}; the agent must sign in to Vobiz from the softphone again`);
+    return sendXml(res, `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>This call cannot be connected right now.</Speak><Hangup/></Response>`);
+  }
+  // The signature names the account. A browser signed in on one account is
+  // never dialled out for by a webhook another account's token signed.
+  if (session.mode === "account" && session.authId !== authId) {
+    console.warn(`[backend] /answer — ${session.agentId} is on ${session.authId}, but the webhook was signed for ${authId || "no account"}; refused`);
     return sendXml(res, `<?xml version="1.0" encoding="UTF-8"?><Response><Speak>This call cannot be connected right now.</Speak><Hangup/></Response>`);
   }
   const { agentId } = session;
@@ -496,7 +631,7 @@ function trackManualDial(callUuid, agentId, session, customer) {
 /** hangup_url of the provisioned application: acknowledge, nothing else. */
 async function handleHangup(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
-  vobizWebhookAllowed(req, url, accountForWebhook(body, url));
+  authenticateWebhook(req, url, body);
   sendXml(res, EMPTY_XML);
 }
 
@@ -565,8 +700,8 @@ function answererFromDialEvent(tracked, body) {
 /** Dial callbackUrl: DialAnswer is the moment the B leg picked up. */
 async function handleDialEvent(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
-  const authId = accountForWebhook(body, url);
-  if (!vobizWebhookAllowed(req, url, authId)) return sendXml(res, EMPTY_XML);
+  const { ok, authId } = authenticateWebhook(req, url, body);
+  if (!ok) return sendXml(res, EMPTY_XML);
   const event = String(body.Event || "");
   const action = String(body.DialAction || "").toLowerCase();
   const callUuid = body.CallUUID || body.DialALegUUID;
@@ -587,8 +722,8 @@ async function handleDialEvent(req, res, url) {
  */
 async function handleDialResult(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
-  const authId = accountForWebhook(body, url);
-  if (!vobizWebhookAllowed(req, url, authId)) return sendXml(res, EMPTY_XML);
+  const { ok, authId } = authenticateWebhook(req, url, body);
+  if (!ok) return sendXml(res, EMPTY_XML);
   const agentId = url.searchParams.get("agentId");
   console.log(`[backend] dial finished — DialStatus=${body.DialStatus} DialHangupCause=${body.DialHangupCause}`);
   const session = agentId && vobizAccounts.sessionFor(agentId);
@@ -609,8 +744,8 @@ async function handleDialResult(req, res, url) {
 
 async function handleRecordingReady(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
-  const authId = accountForWebhook(body, url);
-  if (!vobizWebhookAllowed(req, url, authId)) return sendJson(res, 200, { received: false });
+  const { ok, authId } = authenticateWebhook(req, url, body);
+  if (!ok) return sendJson(res, 200, { received: false });
   sendJson(res, 200, { received: true });
 
   // Any call Zoho is tracking — browser-originated or inbound. Keyed on the
@@ -631,24 +766,34 @@ async function handleRecordingReady(req, res, url) {
  */
 async function handleInboundAnswer(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
-  const authId = accountForWebhook(body, url);
-  if (!vobizWebhookAllowed(req, url, authId)) return sendXml(res, HANGUP_XML);
+  const { ok, authId } = authenticateWebhook(req, url, body);
+  if (!ok) return sendXml(res, HANGUP_XML);
   if ((body.Event || "") === "Hangup") return sendXml(res, EMPTY_XML);
-  return answerInbound(body, res);
+  return answerInbound(body, res, authId);
 }
 
-/** PSTN caller -> DID: ring the signed-in agents of the account that owns it. */
-function answerInbound(body, res) {
+/**
+ * PSTN caller -> DID: ring the signed-in agents of `authId`, the account
+ * whose token verified this webhook. With no account (SIP direct, which has
+ * no token), only SIP-direct agents whose number was dialled ring. Nothing in
+ * the body — ParentAuthID, To — can point the call at another account's agents.
+ */
+function answerInbound(body, res, authId) {
   const callUuid = body.CallUUID || body.call_uuid || null;
   const caller = toE164(body.From || body.from);
   const dialled = toE164(body.To || body.to);
-  // The answer webhook names the account in ParentAuthID; the dialled number
-  // is the fallback (and the only route to SIP-direct agents).
-  const parent = body.ParentAuthID || body.parentauthid;
-  const byParent = vobizAccounts.agentsForAccount(parent);
-  const match = byParent.length
-    ? { authId: parent, number: dialled, agents: byParent }
-    : vobizAccounts.accountForNumber(dialled);
+  let match = null;
+  if (authId) {
+    const owner = vobizAccounts.accountForNumber(dialled);
+    match = {
+      authId,
+      number: owner && owner.authId === authId ? owner.number : dialled,
+      agents: vobizAccounts.agentsForAccount(authId),
+    };
+  } else {
+    const agents = vobizAccounts.sipDirectAgentsForNumber(dialled);
+    if (agents.length) match = { authId: null, number: agents[0].inboundNumber, agents };
+  }
   const publicBaseUrl = getPublicBaseUrl();
   if (!match || !match.agents.length || !publicBaseUrl) {
     console.warn(`[backend] inbound ${caller} -> ${dialled}: ${!match ? "no signed-in Vobiz account or SIP-direct agent owns this number" : "no agent of " + match.authId + " is signed in"} — hanging up politely`);
@@ -656,8 +801,12 @@ function answerInbound(body, res) {
   }
   const agentIds = match.agents.map(a => a.agentId);
   console.log(`[backend] inbound call ${caller} -> ${dialled} (${match.authId || "SIP direct"}), ringing ${agentIds.join(", ")}`);
+  // Only a plain caller name or the number reaches the softphone, and the
+  // call id only if it looks like one.
+  const routedFrom = callerLabel(body.CallerName, caller);
+  const routedUuid = /^[A-Za-z0-9-]{1,64}$/.test(String(callUuid || "")) ? callUuid : null;
   for (const agentId of agentIds) {
-    pushAgentEvent(agentId, { type: "inbound-routed", from: body.CallerName || caller || "unknown", callUuid });
+    pushAgentEvent(agentId, { type: "inbound-routed", from: routedFrom, callUuid: routedUuid });
   }
 
   // The call is tracked under the first ringing agent that belongs to a
@@ -955,7 +1104,9 @@ async function handleZohoPbClickToDial(req, res, url) {
   }
   const fields = await readBody(req).catch(() => ({}));
   for (const [k, v] of url.searchParams) if (!(k in fields)) fields[k] = v;
-  const to = fields.tonumber || fields.toNumber || fields.to;
+  const rawTo = fields.tonumber || fields.toNumber || fields.to;
+  // Only a phone number is ever handed to the softphone.
+  const to = dialableNumber(rawTo);
   const org = zohoPhoneBridge.getOrg(orgId);
 
   // Zoho says who clicked. When that user is mapped to an agent, it wins over
@@ -967,19 +1118,20 @@ async function handleZohoPbClickToDial(req, res, url) {
   const session = vobizAccounts.sessionFor(agentId);
   const from = (session && session.callerId) || "";
   const effectiveZohoUser = zohoUser || (org && org.agentMap && org.agentMap[agentId]) || null;
-  console.log(`[zoho-pb] click-to-dial — org=${orgId} agent=${agentId} to=${to} zohouser=${zohoUser}`);
+  console.log(`[zoho-pb] click-to-dial — org=${orgId} agent=${agentId} to=${to || JSON.stringify(String(rawTo || "").slice(0, 40))} zohouser=${zohoUser}`);
 
   const failWith = async (code, status, payload) => {
     if (org) {
       await zohoPhoneBridge.notifyClickToDialError({
-        orgId, from, to: to || "", code, credentials: pbCredentials(),
+        orgId, from, to: to || String(rawTo || "").slice(0, 40), code, credentials: pbCredentials(),
       }).catch(err => console.error("[zoho-pb] clicktodialerror notify failed:", err.message));
     }
     return sendJson(res, status, payload);
   };
 
-  if (!to) return sendJson(res, 400, { status: "error", message: "no 'tonumber' in the request" });
+  if (!rawTo) return sendJson(res, 400, { status: "error", message: "no 'tonumber' in the request" });
   if (!org) return sendJson(res, 400, { status: "error", message: `unknown or unconnected orgId '${orgId}'` });
+  if (!to) return failWith("INVALID_NUMBER", 400, { status: "error", message: "'tonumber' is not a phone number" });
   if (!agent) return failWith("UNKNOWN_AGENT", 400, { status: "error", message: `unknown agent '${agentId}'` });
   const publicBaseUrl = getPublicBaseUrl();
   if (!publicBaseUrl) return failWith("NOT_CONFIGURED", 500, { status: "error", message: "PUBLIC_BASE_URL not set" });
@@ -991,7 +1143,7 @@ async function handleZohoPbClickToDial(req, res, url) {
     return failWith("AGENT_OFFLINE", 409, {
       status: "error",
       message: `agent '${agentId}' is not signed in to the softphone`,
-      hint: "open /agent-phone and sign in with the Vobiz Auth ID and Auth Token",
+      hint: "open /agent-phone and sign in to Vobiz there",
     });
   }
   if (!from) return failWith("NO_CALLER_ID", 409, { status: "error", message: "the agent's Vobiz account has no number to use as caller ID" });
@@ -1122,7 +1274,25 @@ function handleAgentMe(req, res, requestedId) {
     agentId,
     displayName: agent.displayName || agentId,
     vobiz: session ? { mode: session.mode, authId: session.authId, callerId: session.callerId } : null,
+    // How the softphone offers the "Vobiz account" sign-in: on the account an
+    // admin connected for this agent (no fields to fill), or — only when the
+    // backend allows it — with a typed Auth ID and Auth Token.
+    vobizSignIn: { connectedAccount: connectedAccountFor(agentId), agentTokenAllowed: agentTokenSignInAllowed() },
   });
+}
+
+/**
+ * The connected Vobiz account an agent signs in on: the one assigned to them
+ * in agents.json (`vobizAccount`), or the only connected account. Never one
+ * the browser asks for — with several customers' accounts connected, an
+ * agent must not be able to pick another customer's.
+ */
+function connectedAccountFor(agentId) {
+  const ids = vobizAccounts.connectedAccountIds();
+  const agent = getAgent(agentId);
+  const assigned = agent && agent.vobizAccount ? String(agent.vobizAccount).trim() : null;
+  if (assigned) return ids.includes(assigned) ? assigned : null;
+  return ids.length === 1 ? ids[0] : null;
 }
 
 /** The agent's cookie names the agent; the body names the Vobiz account. */
@@ -1143,22 +1313,39 @@ function vobizErrorStatus(err) {
 }
 
 /**
- * Softphone sign-in to Vobiz. Verifies the Auth ID + Auth Token, finds or
- * creates this integration's application in that account and the agent's
- * endpoint, and returns the SIP login with a fresh password. The token stays
- * in server memory; it is not echoed back.
+ * Softphone sign-in to Vobiz, on the account an admin connected for this
+ * agent: no Auth Token from the browser. Finds or creates this integration's
+ * application in that account and the agent's endpoint, and returns the SIP
+ * login with a fresh password.
+ *
+ * A request that carries an Auth Token is the old sign-in, where the agent
+ * typed the account's master key. It is refused unless ALLOW_AGENT_AUTH_TOKEN
+ * is on; then it works as before and the token stays in server memory only.
  */
 async function handleVobizSession(req, res) {
   const agentId = agentOr401(req, res);
   if (!agentId) return;
   const { authId, authToken, callerId } = await readBody(req).catch(() => ({}));
   res.setHeader("Cache-Control", "no-store");
+  // A softphone tab of this agent is open: join its session instead of
+  // rotating the SIP password out from under it.
+  const reuseLiveSession = hasAgentListener(agentId);
   try {
-    // A softphone tab of this agent is open: join its session instead of
-    // rotating the SIP password out from under it.
-    const out = await vobizAccounts.signIn({
-      agentId, authId, authToken, callerId, publicBaseUrl: getPublicBaseUrl(), reuseLiveSession: hasAgentListener(agentId),
-    });
+    let out;
+    if (authToken) {
+      if (!agentTokenSignInAllowed()) {
+        return sendJson(res, 403, {
+          error: "Agents do not sign in with the account's Auth Token here. Ask your admin to connect the Vobiz account; then sign in without it.",
+        });
+      }
+      out = await vobizAccounts.signIn({ agentId, authId, authToken, callerId, publicBaseUrl: getPublicBaseUrl(), reuseLiveSession });
+    } else {
+      const account = connectedAccountFor(agentId);
+      if (!account) {
+        return sendJson(res, 409, { error: "No Vobiz account is connected for you yet. Ask your admin to connect it." });
+      }
+      out = await vobizAccounts.signInConnected({ agentId, authId: account, callerId, publicBaseUrl: getPublicBaseUrl(), reuseLiveSession });
+    }
     sendJson(res, 200, out);
   } catch (err) {
     console.warn(`[vobiz] sign-in for ${agentId} failed: ${err.message}`);
@@ -1259,6 +1446,44 @@ async function handleAdminSession(req, res) {
   sendJson(res, 200, { ok: true, next: `${getPublicBaseUrl() || ""}/zoho/phonebridge/connect` }, { "Set-Cookie": auth.adminCookie(req) });
 }
 
+/** Admin: the form for connecting a Vobiz account, for a browser with the admin cookie. */
+function handleVobizAccountForm(req, res) {
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(`<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect a Vobiz account</title>
+<style>:root{color-scheme:light dark}body{font:15px/1.6 system-ui,sans-serif;max-width:520px;margin:0 auto;padding:32px 16px}
+input,button{font-size:15px;padding:10px;width:100%;box-sizing:border-box;margin-top:8px}</style>
+<h1>Connect a Vobiz account</h1>
+<p>The Auth ID and Auth Token from Vobiz Console &rarr; API credentials. The token is checked with Vobiz and
+stored encrypted on this backend. Agents then sign in from the softphone without it.</p>
+<form method="POST" action="vobiz-account" autocomplete="off">
+<input name="authId" placeholder="Auth ID" spellcheck="false" autofocus>
+<input name="authToken" type="password" placeholder="Auth Token">
+<button>Connect</button></form>`);
+}
+
+/** Admin: connect a Vobiz account once. Ids and counts in the reply, never the token. */
+async function handleVobizAccountConnect(req, res) {
+  const { authId, authToken } = await readBody(req).catch(() => ({}));
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const out = await vobizAccounts.connectAccount({ authId, authToken, publicBaseUrl: getPublicBaseUrl() });
+    sendJson(res, 200, { connected: true, ...out, next: "Agents now sign in to Vobiz from the softphone without the Auth Token." });
+  } catch (err) {
+    console.warn(`[vobiz] connecting a Vobiz account failed: ${err.message}`);
+    sendJson(res, vobizErrorStatus(err), { error: err.message });
+  }
+}
+
+/** Admin: forget a connected account and sign its agents out. */
+async function handleVobizAccountDisconnect(req, res) {
+  const { authId } = await readBody(req).catch(() => ({}));
+  const id = String(authId || "").trim();
+  if (!id || !vobizAccounts.disconnectAccount(id)) return sendJson(res, 404, { error: `no connected Vobiz account '${id}'` });
+  sendJson(res, 200, { disconnected: id });
+}
+
 function handleAgentLinks(req, res) {
   const base = getPublicBaseUrl() || "";
   const links = {};
@@ -1274,11 +1499,7 @@ function handleAgentLinks(req, res) {
 // ---------------------------------------------------------------------------
 
 const wrap = fn => (req, res, ...args) =>
-  Promise.resolve(fn(req, res, ...args)).catch(err => {
-    console.error(`[backend] ${req.method} ${req.url.split("?")[0]} failed:`, err);
-    if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
-    else res.end();
-  });
+  Promise.resolve(fn(req, res, ...args)).catch(err => failRequest(req, res, err));
 
 function requireAdmin(handler) {
   return (req, res, ...args) => {
@@ -1319,6 +1540,9 @@ const routes = {
   "GET /admin/login": handleAdminLoginForm,
   "POST /admin/session": wrap(handleAdminSession),
   "GET /admin/agent-links": requireAdmin(handleAgentLinks),
+  "GET /admin/vobiz-account": requireAdmin(handleVobizAccountForm),
+  "POST /admin/vobiz-account": requireAdmin(wrap(handleVobizAccountConnect)),
+  "POST /admin/vobiz-account/disconnect": requireAdmin(wrap(handleVobizAccountDisconnect)),
   "GET /zoho/phonebridge/connect": requireAdmin(wrap(handleZohoPbConnect)),
   "GET /zoho/phonebridge/complete": requireAdmin(handleZohoPbCompleteForm),
   "POST /zoho/phonebridge/complete": requireAdmin(wrap(handleZohoPbComplete)),
@@ -1343,7 +1567,7 @@ const routes = {
   "GET /call-events": (req, res) => handleCallEvents(req, res, null),
 };
 
-const server = http.createServer((req, res) => {
+function dispatch(req, res) {
   auth.applyCors(req, res);
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "no-referrer");
@@ -1363,11 +1587,11 @@ const server = http.createServer((req, res) => {
   const route = routes[`${req.method} ${p}`];
   if (route) return route(req, res, url);
 
-  if (req.method === "GET" && p.startsWith("/agent/")) {
-    return handleAgentMe(req, res, decodeURIComponent(p.slice("/agent/".length)));
-  }
-  if (req.method === "GET" && p.startsWith("/call-events/")) {
-    return handleCallEvents(req, res, decodeURIComponent(p.slice("/call-events/".length)));
+  if (req.method === "GET" && (p.startsWith("/agent/") || p.startsWith("/call-events/"))) {
+    const prefix = p.startsWith("/agent/") ? "/agent/" : "/call-events/";
+    const id = decodeSegment(p.slice(prefix.length));
+    if (id === null) return sendJson(res, 400, { error: "bad request" });
+    return prefix === "/agent/" ? handleAgentMe(req, res, id) : handleCallEvents(req, res, id);
   }
 
   // Static files come from a fixed whitelist — no path from the request ever
@@ -1376,12 +1600,28 @@ const server = http.createServer((req, res) => {
   if (file) {
     return fs.readFile(path.join(__dirname, "public", file[0]), (err, buf) => {
       if (err) return sendJson(res, 404, { error: "not found" });
-      res.writeHead(200, { "Content-Type": file[1], "Cache-Control": "no-store" });
+      const headers = { "Content-Type": file[1], "Cache-Control": "no-store" };
+      if (file[0] === "agent-phone.html") headers["Content-Security-Policy"] = softphoneCsp(buf);
+      res.writeHead(200, headers);
       res.end(buf);
     });
   }
 
   sendJson(res, 404, { error: "not found" });
+}
+
+/**
+ * Every request runs inside this guard. A handler that throws, or rejects,
+ * gets a 500 for that one request; the process — every other agent's session,
+ * every call in progress — carries on.
+ */
+const server = http.createServer((req, res) => {
+  try {
+    const out = dispatch(req, res);
+    if (out && typeof out.catch === "function") out.catch(err => failRequest(req, res, err));
+  } catch (err) {
+    failRequest(req, res, err);
+  }
 });
 
 // Only bind the port when run directly; the test suite requires the module.
@@ -1393,9 +1633,21 @@ function startServer() {
   if (!process.env.ADMIN_TOKEN) console.warn("[backend] ADMIN_TOKEN is not set — admin routes are disabled");
   if (!pbConfigured()) console.warn("[backend] ZOHO_PB_CLIENT_ID / _SECRET / _REDIRECT_URI not all set — Zoho connect is disabled");
   if (!getPublicBaseUrl()) console.warn("[backend] PUBLIC_BASE_URL is not set — Vobiz and Zoho cannot reach this backend");
+  if (!signatureRequired()) {
+    console.warn("[backend] REQUIRE_VOBIZ_SIGNATURE=false — Vobiz webhooks are accepted WITHOUT a valid signature, so anyone who can reach this backend can send it fake call events. Remove it once your logs show \"signature ok\".");
+  }
+  if (agentTokenSignInAllowed()) {
+    console.warn("[backend] ALLOW_AGENT_AUTH_TOKEN=true — agents may type the account's Auth Token into the softphone. Connect the account at /admin/vobiz-account instead, then remove this.");
+  }
+  const connected = vobizAccounts.connectedAccountIds();
+  console.log(`[backend] ${connected.length} Vobiz account(s) connected${connected.length ? "" : " — an admin connects one at /admin/vobiz-account"}`);
+  // A promise someone forgot to catch is logged, not fatal: the process holds
+  // every agent's session and every call in progress.
+  process.on("unhandledRejection", err => console.error("[backend] unhandled rejection (still running):", err));
   server.listen(Number(PORT) || 8092, () => {
     console.log(`[backend] listening on http://localhost:${Number(PORT) || 8092} — public URL ${getPublicBaseUrl() || "(unset)"}`);
   });
 }
 
-module.exports = { server, startServer, finalizeZohoPhoneBridgeCall, auth, verifyVobizSignature };
+// `routes` is exported so the test suite can prove the request guard holds.
+module.exports = { server, startServer, finalizeZohoPhoneBridgeCall, auth, verifyVobizSignature, routes };

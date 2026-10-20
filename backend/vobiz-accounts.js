@@ -1,11 +1,20 @@
 "use strict";
 
 /**
- * Any Vobiz account, signed in from the softphone.
+ * Any Vobiz account, connected once by an admin.
  *
- * Nothing about a Vobiz account lives in env or in a tracked file. An agent
- * types their Auth ID and Auth Token into the softphone; this module checks the
- * pair against Vobiz and provisions what the integration needs in THAT account:
+ * Nothing about a Vobiz account lives in env or in a tracked file. An admin
+ * connects the account once (POST /admin/vobiz-account): this module checks
+ * the Auth ID + Auth Token against Vobiz and seals the token into
+ * DATA_DIR/vobiz-accounts.json with TOKEN_ENCRYPTION_KEY (AES-256-GCM, bound
+ * to the Auth ID). Agents then sign in from the softphone WITHOUT the token —
+ * the account's master key never reaches an agent's browser. An agent uses the
+ * account assigned to them in agents.json (`vobizAccount`), or the only
+ * connected account. Typing the Auth Token into the softphone, the old way, is
+ * refused unless ALLOW_AGENT_AUTH_TOKEN=true (see server.js).
+ *
+ * Either way, signing an agent in provisions what the integration needs in
+ * THAT account:
  *
  *   - one Application whose answer_url is <PUBLIC_BASE_URL>/answer — found if
  *     this backend created it before, created otherwise. An application with
@@ -26,9 +35,12 @@
  * number list or "Enable inbound"); the customer binds the endpoint and DID to
  * an application whose answer_url is <PUBLIC_BASE_URL>/answer themselves.
  *
- * The account Auth Token stays in this process's memory, keyed by authId. It is
- * never written to disk, logged, or returned in a response. After a restart an
- * account is unknown until one of its agents signs in again.
+ * The Auth Token is never logged or returned in a response. A connected
+ * account's token is on disk only in sealed form, and is loaded back after a
+ * restart, so webhooks for it can still be verified and its recording links
+ * still play. A token an agent typed (ALLOW_AGENT_AUTH_TOKEN=true) stays in
+ * memory only, as before: after a restart that account is unknown until one of
+ * its agents signs in again.
  *
  * Vobiz app ids are 17 digits — above Number.MAX_SAFE_INTEGER. They are kept as
  * strings end to end: responses are read with long integers quoted before
@@ -41,6 +53,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { createTokenStore } = require("./token-store");
 
 const API = "https://api.vobiz.ai/api/v1";
 const APP_NAME = "Vobiz-Zoho-PhoneBridge";
@@ -134,7 +147,7 @@ function dropStoredEndpoint(authId, agentId) {
 // In-memory state
 // ---------------------------------------------------------------------------
 
-const accounts = new Map();      // authId -> { authToken, numbers: [e164], appId }
+const accounts = new Map();      // authId -> { authToken, numbers: [e164], appId, connected }
 const agentSessions = new Map(); // agentId -> { mode, authId, sipUser, endpointId, callerId, inboundNumber }
 const sipUsers = new Map();      // lower(sipUser) -> agentId
 const lastChoice = new Map();    // authId:agentId -> last caller ID picked
@@ -143,12 +156,48 @@ const lastChoice = new Map();    // authId:agentId -> last caller ID picked
 // whose entries are spread into webhook routing results.
 const livePasswords = new Map();
 
+// Accounts an admin connected: { authId -> { authToken (sealed), connectedAt } }.
+const connectedStore = createTokenStore({ fileName: "vobiz-accounts.json", secretFields: ["authToken"], idField: "authId" });
+let connectedLoaded = false;
+
+/**
+ * Load every connected account's token into memory, once. Called lazily by
+ * everything that reads `accounts`, so a restart (or the test suite's reset)
+ * picks the accounts up again. Numbers and the application are refreshed from
+ * Vobiz when an agent signs in; the token alone is enough to verify webhooks
+ * and play recordings.
+ */
+function loadConnected() {
+  if (connectedLoaded) return;
+  connectedLoaded = true;
+  let ids = [];
+  try {
+    ids = connectedStore.listPublic().map(r => r.authId).filter(Boolean);
+  } catch (err) {
+    console.error(`[vobiz] could not read the connected Vobiz accounts: ${err.message}`);
+    return;
+  }
+  for (const authId of ids) {
+    try {
+      const rec = connectedStore.get(authId);
+      if (!rec || !rec.authToken) continue;
+      const existing = accounts.get(authId);
+      accounts.set(authId, existing
+        ? { ...existing, authToken: rec.authToken, connected: true }
+        : { authToken: rec.authToken, numbers: [], numberInfo: [], appId: null, appNames: {}, connected: true });
+    } catch (err) {
+      console.error(`[vobiz] could not load the connected account ${authId}: ${err.message}`);
+    }
+  }
+}
+
 function resetForTests() {
   accounts.clear();
   agentSessions.clear();
   sipUsers.clear();
   lastChoice.clear();
   livePasswords.clear();
+  connectedLoaded = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +375,7 @@ async function provisionEndpoint(authId, authToken, agentId, appId) {
  * not knocked off its registration. The pair is still checked with Vobiz.
  */
 async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl, reuseLiveSession = false }) {
+  loadConnected();
   authId = String(authId || "").trim();
   authToken = String(authToken || "").trim();
   if (!/^[A-Za-z0-9_]{4,64}$/.test(authId) || !authToken) throw new VobizAuthError("enter your Vobiz Auth ID and Auth Token");
@@ -334,7 +384,8 @@ async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl, reu
   const numberInfo = await listNumbers(authId, authToken);
   const numbers = numberInfo.map(n => n.e164);
   const { appId, names: appNames } = await findOrCreateApplication(authId, authToken, publicBaseUrl);
-  accounts.set(authId, { authToken, numbers, numberInfo, appId, appNames });
+  const wasConnected = Boolean(accounts.get(authId) && accounts.get(authId).connected);
+  accounts.set(authId, { authToken, numbers, numberInfo, appId, appNames, connected: wasConnected });
 
   const current = agentSessions.get(agentId);
   const live = livePasswords.get(agentId);
@@ -367,6 +418,62 @@ async function signIn({ agentId, authId, authToken, callerId, publicBaseUrl, reu
     applicationBound: ep.bound,
     reusedSession: reuse,
   };
+}
+
+/**
+ * Sign an agent in on an account an admin connected. The token comes from the
+ * sealed store, never from the browser; everything else is signIn as usual,
+ * including the check with Vobiz, so a token revoked in the Vobiz Console
+ * stops working here too.
+ */
+async function signInConnected({ agentId, authId, callerId, publicBaseUrl, reuseLiveSession = false }) {
+  loadConnected();
+  const acct = accounts.get(authId);
+  if (!acct || !acct.connected) throw new VobizApiError("that Vobiz account is not connected on this backend — ask your admin", 409);
+  return signIn({ agentId, authId, authToken: acct.authToken, callerId, publicBaseUrl, reuseLiveSession });
+}
+
+/**
+ * Admin: connect an account once. Checks the pair with Vobiz (listing the
+ * numbers is the check), finds or creates this integration's application, and
+ * seals the token on disk. Returns ids and counts only.
+ */
+async function connectAccount({ authId, authToken, publicBaseUrl }) {
+  loadConnected();
+  authId = String(authId || "").trim();
+  authToken = String(authToken || "").trim();
+  if (!/^[A-Za-z0-9_]{4,64}$/.test(authId) || !authToken) throw new VobizAuthError("enter the account's Auth ID and Auth Token");
+  if (!publicBaseUrl) throw new VobizApiError("PUBLIC_BASE_URL is not set on this backend", 500);
+  const numberInfo = await listNumbers(authId, authToken);
+  const { appId, names: appNames } = await findOrCreateApplication(authId, authToken, publicBaseUrl);
+  const previous = connectedStore.get(authId);
+  connectedStore.put(authId, { authToken, connectedAt: (previous && previous.connectedAt) || new Date().toISOString() });
+  accounts.set(authId, { authToken, numbers: numberInfo.map(n => n.e164), numberInfo, appId, appNames, connected: true });
+  console.log(`[vobiz] ${authId} connected by an admin — its agents sign in without the Auth Token`);
+  return { authId, numbers: numberInfo.length, applicationId: appId };
+}
+
+/**
+ * Admin: forget a connected account. Its sealed token is deleted, and every
+ * agent signed in on it is signed out — their phone lines stop at the next
+ * registration refresh.
+ */
+function disconnectAccount(authId) {
+  loadConnected();
+  const removed = connectedStore.remove(authId);
+  const acct = accounts.get(authId);
+  if (acct) {
+    for (const [agentId, s] of [...agentSessions]) if (s.authId === authId) signOut(agentId);
+    accounts.delete(authId);
+    console.log(`[vobiz] ${authId} disconnected by an admin`);
+  }
+  return Boolean(removed || acct);
+}
+
+/** Auth IDs an admin connected. */
+function connectedAccountIds() {
+  loadConnected();
+  return [...accounts].filter(([, a]) => a.connected).map(([authId]) => authId);
 }
 
 /** "+91 00000-00001" -> "+910000000001"; null unless 8–15 digits. */
@@ -437,6 +544,7 @@ function sessionForSipFrom(from) {
 
 /** The signed-in account that owns a dialled DID, and its signed-in agents. */
 function accountForNumber(raw) {
+  loadConnected();
   const want = digitsOf(raw);
   if (!want) return null;
   for (const [authId, acct] of accounts) {
@@ -455,8 +563,17 @@ function accountForNumber(raw) {
 
 /** Signed-in Vobiz-account agents of one account (inbound routing by ParentAuthID). */
 function agentsForAccount(authId) {
+  loadConnected();
   if (!authId || !accounts.has(authId)) return [];
   return [...agentSessions].filter(([, s]) => s.authId === authId).map(([agentId, s]) => ({ agentId, ...s }));
+}
+
+/** SIP-direct agents whose caller ID (their inbound number) is this number. */
+function sipDirectAgentsForNumber(raw) {
+  const want = digitsOf(raw);
+  if (!want) return [];
+  return [...agentSessions].filter(([, s]) => s.mode === "sip" && digitsOf(s.inboundNumber) === want)
+    .map(([agentId, s]) => ({ agentId, ...s }));
 }
 
 /**
@@ -475,8 +592,14 @@ function headerCallerId(session, raw) {
 }
 
 /** The token is read only through here, and only for server-side calls. */
-const tokenFor = authId => (authId && accounts.has(authId) ? accounts.get(authId).authToken : null);
-const knownAccount = authId => Boolean(authId && accounts.has(authId));
+function tokenFor(authId) {
+  loadConnected();
+  return authId && accounts.has(authId) ? accounts.get(authId).authToken : null;
+}
+function knownAccount(authId) {
+  loadConnected();
+  return Boolean(authId && accounts.has(authId));
+}
 
 /** "Enable inbound calls": attach one of the account's DIDs to our application. */
 async function attachNumber(agentId, number) {
@@ -499,9 +622,11 @@ async function attachNumber(agentId, number) {
 
 /** Admin status — ids and counts only. */
 function listSignedIn() {
+  loadConnected();
   const sipDirect = [...agentSessions].filter(([, s]) => s.mode === "sip").map(([id]) => id);
   return [...accounts].map(([authId, a]) => ({
     authId,
+    connected: Boolean(a.connected),
     numbers: a.numbers.length,
     applicationId: a.appId,
     agents: [...agentSessions].filter(([, s]) => s.authId === authId).map(([id]) => id),
@@ -510,6 +635,10 @@ function listSignedIn() {
 
 module.exports = {
   signIn,
+  signInConnected,
+  connectAccount,
+  disconnectAccount,
+  connectedAccountIds,
   signInSipDirect,
   cleanPhone,
   signOut,
@@ -518,6 +647,7 @@ module.exports = {
   sessionForSipFrom,
   accountForNumber,
   agentsForAccount,
+  sipDirectAgentsForNumber,
   headerCallerId,
   tokenFor,
   knownAccount,

@@ -30,8 +30,9 @@ const crypto = require("crypto");
 // --- Isolated environment, set before anything is required ---------------
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "vobiz-zoho-test-"));
-const MOCK_PORT = 8094;
-const MOCK = `http://127.0.0.1:${MOCK_PORT}`;
+// The mock Zoho listens on a free port, set once it is up — a fixed port
+// collides with anything else running on the machine.
+let MOCK = "";
 const AGENTS_FILE = path.join(TMP, "agents.json");
 const ENC_KEY = crypto.randomBytes(32).toString("base64");
 
@@ -48,7 +49,13 @@ Object.assign(process.env, {
   ZOHO_PB_REDIRECT_URI: "https://example.test/oauth/zoho/callback",
   ZOHO_PB_RECORDING_GRACE_MS: "60000",
 });
-for (const k of ["VOBIZ_AUTH_ID", "VOBIZ_AUTH_TOKEN", "VOBIZ_FROM_NUMBER", "REQUIRE_VOBIZ_SIGNATURE", "CLICKTODIAL_WHEN_OFFLINE", "ZOHO_PB_SEND_MISSED_STATE", "RECORDING_URL_SECRET", "OUTBOUND_RECORD", "INBOUND_RECORD"]) delete process.env[k];
+for (const k of ["VOBIZ_AUTH_ID", "VOBIZ_AUTH_TOKEN", "VOBIZ_FROM_NUMBER", "REQUIRE_VOBIZ_SIGNATURE", "ALLOW_AGENT_AUTH_TOKEN", "CLICKTODIAL_WHEN_OFFLINE", "ZOHO_PB_SEND_MISSED_STATE", "RECORDING_URL_SECRET", "OUTBOUND_RECORD", "INBOUND_RECORD"]) delete process.env[k];
+// Sections [1]–[16] exercise call flows, not authentication: they post
+// unsigned webhooks and sign agents in with a typed Auth Token, so they run
+// with both old behaviours switched back on. Sections [19] and [20] switch
+// them off and test the defaults — signatures required, token sign-in refused.
+process.env.REQUIRE_VOBIZ_SIGNATURE = "false";
+process.env.ALLOW_AGENT_AUTH_TOKEN = "true";
 
 fs.writeFileSync(AGENTS_FILE, JSON.stringify({
   priya: { displayName: "Priya", zohoUser: "600001" },
@@ -119,7 +126,10 @@ function startMockZoho() {
         json(200, { status: "success", code: "SUCCESS" });
       });
     });
-    server.listen(MOCK_PORT, "127.0.0.1", () => resolve(server));
+    server.listen(0, "127.0.0.1", () => {
+      MOCK = `http://127.0.0.1:${server.address().port}`;
+      resolve(server);
+    });
   });
 }
 
@@ -247,7 +257,7 @@ globalThis.fetch = async (input, init = {}) => {
 const pb = require("./zoho-phonebridge");
 const { createTokenStore } = require("./token-store");
 const vobizAccounts = require("./vobiz-accounts");
-const { server, auth, finalizeZohoPhoneBridgeCall, verifyVobizSignature } = require("./server");
+const { server, auth, finalizeZohoPhoneBridgeCall, verifyVobizSignature, routes } = require("./server");
 let B = "";
 
 // Every response this backend sends through req() is kept, so the suite can
@@ -663,7 +673,7 @@ async function testAnyAccount(orgId) {
   check("a webhook for MA_TEST0001 signed with MA_TEST0002's token is refused", /<Hangup\/>/.test(await r.text()));
   r = await post("/answer", from, sign("tok-one-secret-value"));
   check("signed with MA_TEST0001's own token it is accepted", /<Number>919999900009<\/Number>/.test(await r.text()));
-  delete process.env.REQUIRE_VOBIZ_SIGNATURE;
+  process.env.REQUIRE_VOBIZ_SIGNATURE = "false";
 
   // Outbound caller ID: X-VH-Caller-ID, only a number of that account.
   r = await post("/answer", { ...from, "X-VH-Caller-ID": "+910000000001" });
@@ -884,6 +894,217 @@ async function testNoAgentsFile() {
   check("and the server is still up", h.status === 200);
 }
 
+async function testMalformedRequests() {
+  console.log("\n[17] A malformed request never takes the process down");
+  const raw = (p, init = {}) => realFetch(`${B}${p}`, { redirect: "manual", ...init });
+  let r = await raw("/agent/%zz");
+  check("GET /agent/%zz is a 400, not a crash", r.status === 400, r.status);
+  r = await raw("/call-events/%E0%A4");
+  check("GET /call-events/%E0%A4 is a 400", r.status === 400, r.status);
+  r = await raw("/admin/agent-links", { headers: { Cookie: "vz_admin=%E0%A4; _ga=50%" } });
+  check("a malformed admin cookie is simply no session (401)", r.status === 401, r.status);
+  r = await raw("/call-events", { headers: { Cookie: "vz_agent=%" } });
+  check("a malformed agent cookie on the event stream is 401", r.status === 401, r.status);
+  r = await raw("/agent-logout", { method: "POST", headers: { Cookie: "theme=%E0" } });
+  check("signing out with a malformed cookie still answers", r.status === 200, r.status);
+  const good = await agentCookie("priya");
+  r = await raw("/agent/me", { headers: { Cookie: `_ga=50%; ${good}` } });
+  check("another app's malformed cookie on the same host does not sign the agent out", r.status === 200, r.status);
+
+  // A handler that throws, or rejects, costs that one request a 500.
+  routes["GET /__test-throws"] = () => { throw new Error("thrown on purpose by test [17]"); };
+  routes["GET /__test-rejects"] = async () => { throw new Error("rejected on purpose by test [17]"); };
+  r = await raw("/__test-throws");
+  check("a handler that throws is answered with a 500", r.status === 500, r.status);
+  r = await raw("/__test-rejects");
+  check("so is one that rejects", r.status === 500, r.status);
+  delete routes["GET /__test-throws"];
+  delete routes["GET /__test-rejects"];
+  r = await raw("/health");
+  check("and the server is still up", r.status === 200 && (await r.text()) === "ok");
+}
+
+async function testSoftphoneHardening(uris) {
+  console.log("\n[18] The softphone shows caller data as text, under a strict Content-Security-Policy");
+  const r = await req("/agent-phone");
+  const html = await r.text();
+  const csp = r.headers.get("content-security-policy") || "";
+  const inline = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(m => m[1]);
+  const hash = inline.length === 1 ? crypto.createHash("sha256").update(inline[0], "utf8").digest("base64") : null;
+  check("the softphone is served with a Content-Security-Policy", csp.startsWith("default-src 'none'"), csp);
+  check("scripts: this origin and the page's own script, pinned by hash — no 'unsafe-inline'",
+    Boolean(hash) && csp.includes(`script-src 'self' 'sha256-${hash}'`) && !/script-src[^;]*unsafe/.test(csp), csp);
+  check("network: only this backend and the Vobiz registrar", /(^|; )connect-src 'self' wss:\/\/registrar\.vobiz\.ai:5063(;|$)/.test(csp), csp);
+  check("the activity log is built from text, never parsed as HTML", !/insertAdjacentHTML|innerHTML|outerHTML|document\.write/.test(html));
+
+  const phone = await openSoftphone("priya", ACCT1);
+  await tick();
+  await post("/answer", { CallUUID: "xss-in-1", From: "919800000009", To: "910000000001", CallerName: '<img src=x onerror="alert(1)">Evil' });
+  await waitFor(() => phone.events.some(e => e.type === "inbound-routed"));
+  const ev = phone.events.find(e => e.type === "inbound-routed");
+  check("a caller name carrying markup never reaches the softphone — the number is shown instead", ev && ev.from === "+919800000009", ev);
+  await post("/answer", { CallUUID: "plain-in-1", From: "919800000010", To: "910000000001", CallerName: "Priya's Bakery" });
+  await waitFor(() => phone.events.filter(e => e.type === "inbound-routed").length >= 2);
+  const ev2 = phone.events.filter(e => e.type === "inbound-routed")[1];
+  check("a plain caller name still is", ev2 && ev2.from === "Priya's Bakery", ev2);
+  for (const id of ["xss-in-1", "plain-in-1"]) pb.untrackCall(id);
+
+  received.length = 0;
+  let rr = await post(uris["600001"], { tonumber: '<img src=x onerror="alert(1)">', zohouser: "600001" });
+  check("a click-to-dial 'number' with markup in it is refused", rr.status === 400, rr.status);
+  await waitFor(() => received.some(x => x.path === "/phonebridge/v3/clicktodialerror"));
+  const err = received.find(x => x.path === "/phonebridge/v3/clicktodialerror");
+  check("and Zoho is told it was not a number (INVALID_NUMBER)", err && err.fields.code === "INVALID_NUMBER", err && err.fields);
+  check("nothing was handed to the softphone", !phone.events.some(e => e.type === "dial"));
+  rr = await post(uris["600001"], { tonumber: "+91 99999-00071", zohouser: "600001" });
+  await waitFor(() => phone.events.some(e => e.type === "dial"));
+  check("a formatted number is reduced to digits before it is dialled",
+    rr.status === 200 && phone.events.some(e => e.type === "dial" && e.to === "+919999900071"), phone.events.filter(e => e.type === "dial"));
+  phone.close();
+  await tick(100);
+}
+
+async function testWebhookSignatures() {
+  console.log("\n[19] Vobiz webhooks must be signed — the default");
+  delete process.env.REQUIRE_VOBIZ_SIGNATURE;
+  const hmac = (tok, s) => crypto.createHmac("sha256", tok).update(s).digest("base64");
+  const v3 = (tok, p, nonce = "n19") => ({ "X-Vobiz-Signature-V3": hmac(tok, `https://example.test${p}.${nonce}`), "X-Vobiz-Signature-V3-Nonce": nonce });
+  const priyaUser = vobizAccounts.sessionFor("priya").sipUser;
+  const inbound = id => ({ CallUUID: id, From: "919800000020", To: "910000000001" });
+
+  received.length = 0;
+  let xml = await (await post("/answer", inbound("sig-in-1"))).text();
+  check("an unsigned inbound /answer is refused — nobody rings", xml.includes("<Hangup/>") && !xml.includes("<Dial"), xml);
+  xml = await (await post("/answer", inbound("sig-in-2"), v3(TOKENS.MA_TEST0002, "/answer"))).text();
+  check("so is one signed with another account's token", xml.includes("<Hangup/>") && !xml.includes("<Dial"), xml);
+  await tick(150);
+  check("and neither reached Zoho", notifies().length === 0, notifies().map(n => n.fields));
+
+  xml = await (await post("/answer", inbound("sig-in-3"), v3(TOKENS.MA_TEST0001, "/answer"))).text();
+  check("signed with the owning account's token, it rings that account's agents", xml.includes(`<User>sip:${priyaUser}@`), xml);
+  xml = await (await post("/answer", inbound("sig-in-4"), {
+    "X-Vobiz-Signature-MA-V3": hmac(TOKENS.MA_TEST0001, "https://example.test/answer.n19"), "X-Vobiz-Signature-V3-Nonce": "n19",
+  })).text();
+  check("X-Vobiz-Signature-MA-V3 (a sub-account's callback, signed by the parent) verifies too", xml.includes("<Dial"), xml);
+  xml = await (await post("/answer", inbound("sig-in-5"), {
+    "X-Vobiz-Signature-V2": hmac(TOKENS.MA_TEST0001, "https://example.test/answern19"), "X-Vobiz-Signature-V2-Nonce": "n19",
+  })).text();
+  check("so does X-Vobiz-Signature-V2", xml.includes("<Dial"), xml);
+
+  // One customer signs with its own token and names another customer in the body.
+  xml = await (await post("/answer?authId=MA_TEST0002", { CallUUID: "sig-in-6", From: "919800000021", To: "910000000001", ParentAuthID: "MA_TEST0001" }, v3(TOKENS.MA_TEST0002, "/answer"))).text();
+  check("a webhook signed by one account never rings another account's agents", !xml.includes(priyaUser) && !xml.includes("<Dial"), xml);
+  xml = await (await post("/answer?authId=MA_TEST0002", { CallUUID: "sig-out-1", From: `sip:${priyaUser}@registrar.vobiz.ai`, To: "919999900090" }, v3(TOKENS.MA_TEST0002, "/answer"))).text();
+  check("nor dials out for another account's browser", !xml.includes("<Number>"), xml);
+
+  // A callback about a call being tracked.
+  received.length = 0;
+  await post("/dial-event?agentId=priya&authId=MA_TEST0001", { Event: "DialAnswer", DialAction: "answer", CallUUID: "sig-in-3" });
+  await tick(150);
+  check("an unsigned dial-event cannot mark a call answered", !notifies().some(n => n.fields.state === "answered"), notifies().map(n => n.fields));
+  await post("/dial-event?agentId=priya&authId=MA_TEST0001", { Event: "DialAnswer", DialAction: "answer", CallUUID: "sig-in-3" }, v3(TOKENS.MA_TEST0001, "/dial-event"));
+  await waitFor(() => notifies().some(n => n.fields.state === "answered"));
+  check("a signed one can", notifies().some(n => n.fields.state === "answered"));
+
+  // SIP direct: this backend holds no token for it, so there is nothing to verify with.
+  xml = await (await post("/answer", { CallUUID: "sig-sip-1", From: "sip:custsip01@registrar.vobiz.ai", To: "919999900091" })).text();
+  check("a live SIP-direct agent's call is still dialled, unverified (no token here)", xml.includes("<Number>919999900091</Number>"), xml);
+  xml = await (await post("/answer", { CallUUID: "sig-sip-2", From: "919800000022", To: "910000000009" })).text();
+  check("and a call to its number still rings it", xml.includes("<User>sip:custsip01@registrar.vobiz.ai</User>"), xml);
+  xml = await (await post("/answer", { CallUUID: "sig-x-1", From: "sip:stranger@registrar.vobiz.ai", To: "919999900092" })).text();
+  check("an unsigned webhook that belongs to nobody here is refused", xml.includes("<Hangup/>") && !xml.includes("<Number>"), xml);
+
+  process.env.REQUIRE_VOBIZ_SIGNATURE = "false";
+  xml = await (await post("/answer", inbound("sig-in-7"))).text();
+  check("REQUIRE_VOBIZ_SIGNATURE=false accepts unsigned webhooks again (debugging only)", xml.includes("<Dial"), xml);
+  for (const id of ["sig-in-1", "sig-in-2", "sig-in-3", "sig-in-4", "sig-in-5", "sig-in-6", "sig-in-7", "sig-out-1", "sig-sip-1", "sig-sip-2", "sig-x-1"]) pb.untrackCall(id);
+}
+
+async function testConnectedAccount() {
+  console.log("\n[20] An admin connects the Vobiz account; agents never handle its Auth Token");
+  delete process.env.ALLOW_AGENT_AUTH_TOKEN;
+  const store = path.join(TMP, "vobiz-accounts.json");
+  const cookie = await agentCookie("nomatch");
+
+  let r = await postJson("/agent/vobiz-session", ACCT1, { Cookie: cookie });
+  let body = await r.json();
+  check("by default an agent cannot sign in with the account's Auth Token", r.status === 403 && /admin/.test(body.error), body);
+  check("and the attempt changes nothing for that agent", vobizAccounts.sessionFor("nomatch").mode === "sip");
+  r = await postJson("/agent/vobiz-session", {}, { Cookie: cookie });
+  check("with no account connected, signing in says to ask the admin", r.status === 409, r.status);
+  body = await (await req("/agent/me", { headers: { Cookie: cookie } })).json();
+  check("the softphone is told: no account connected, token sign-in off",
+    body.vobizSignIn && body.vobizSignIn.connectedAccount === null && body.vobizSignIn.agentTokenAllowed === false, body.vobizSignIn);
+
+  r = await postJson("/admin/vobiz-account", ACCT2);
+  check("connecting an account needs the admin", r.status === 401, r.status);
+  r = await req("/admin/vobiz-account", { headers: ADMIN });
+  check("the admin gets a form to connect one", r.status === 200 && (await r.text()).includes("Connect a Vobiz account"));
+  r = await postJson("/admin/vobiz-account", { authId: "MA_TEST0002", authToken: "wrong-token" }, ADMIN);
+  check("a wrong Auth Token is refused and nothing is stored", r.status === 401 && !fs.existsSync(store), r.status);
+  r = await postJson("/admin/vobiz-account", ACCT2, ADMIN);
+  body = await r.json();
+  check("the admin connects MA_TEST0002 once", r.status === 200 && body.authId === "MA_TEST0002" && body.applicationId === NEW_APP_2, body);
+  const disk = fs.readFileSync(store, "utf8");
+  check("its Auth Token is stored sealed (AES-256-GCM), never in the clear",
+    !disk.includes(TOKENS.MA_TEST0002) && JSON.parse(disk).MA_TEST0002.authToken.startsWith("v1:"), disk);
+
+  body = await (await req("/agent/me", { headers: { Cookie: cookie } })).json();
+  check("the softphone now offers that account", body.vobizSignIn.connectedAccount === "MA_TEST0002", body.vobizSignIn);
+  r = await postJson("/agent/vobiz-session", {}, { Cookie: cookie });
+  body = await r.json();
+  check("the agent signs in without typing anything", r.status === 200 && body.authId === "MA_TEST0002" && Boolean(body.sipPassword), body);
+  check("and gets their own SIP line on that account", vobizAccounts.sessionFor("nomatch").authId === "MA_TEST0002" && vobizAccounts.sessionFor("nomatch").mode === "account");
+
+  // A restart: the token comes back from the sealed store.
+  vobizAccounts.resetForTests();
+  check("after a restart the connected account is known again", vobizAccounts.knownAccount("MA_TEST0002") && vobizAccounts.tokenFor("MA_TEST0002") === TOKENS.MA_TEST0002);
+  delete process.env.REQUIRE_VOBIZ_SIGNATURE;
+  const v3 = tok => ({ "X-Vobiz-Signature-V3": crypto.createHmac("sha256", tok).update("https://example.test/answer.n20").digest("base64"), "X-Vobiz-Signature-V3-Nonce": "n20" });
+  const call = { CallUUID: "restart-1", From: "919800000030", To: "910000000003", ParentAuthID: "MA_TEST0002" };
+  let xml = await (await post("/answer", call, v3(TOKENS.MA_TEST0002))).text();
+  check("so its webhooks still verify straight after a restart", xml.includes("no one is available"), xml);
+  xml = await (await post("/answer", { ...call, CallUUID: "restart-2" })).text();
+  check("and unsigned ones are still refused", !xml.includes("no one is available") && xml.includes("<Hangup/>"), xml);
+  process.env.REQUIRE_VOBIZ_SIGNATURE = "false";
+  r = await postJson("/agent/vobiz-session", {}, { Cookie: cookie });
+  check("the agent signs in again, still without the token", r.status === 200 && (await r.json()).authId === "MA_TEST0002");
+
+  // Several accounts connected: each agent uses the one assigned to them.
+  r = await postJson("/admin/vobiz-account", ACCT1, ADMIN);
+  check("a second account can be connected", r.status === 200);
+  const arjunCookie = await agentCookie("arjun");
+  r = await postJson("/agent/vobiz-session", {}, { Cookie: arjunCookie });
+  check("with two connected, an agent with no assignment is told to ask the admin", r.status === 409, r.status);
+  const savedAgents = fs.readFileSync(AGENTS_FILE, "utf8");
+  const withAssignment = JSON.parse(savedAgents);
+  withAssignment.arjun.vobizAccount = "MA_TEST0001";
+  await tick(20);
+  fs.writeFileSync(AGENTS_FILE, JSON.stringify(withAssignment, null, 2));
+  r = await postJson("/agent/vobiz-session", {}, { Cookie: arjunCookie });
+  body = await r.json();
+  check("an agent assigned in agents.json (vobizAccount) signs in on that account", r.status === 200 && body.authId === "MA_TEST0001", body);
+  r = await postJson("/agent/vobiz-session", { authId: "MA_TEST0002" }, { Cookie: arjunCookie });
+  body = await r.json();
+  check("and cannot ask for a different connected account", r.status === 200 && body.authId === "MA_TEST0001", body);
+  await tick(20);
+  fs.writeFileSync(AGENTS_FILE, savedAgents);
+
+  r = await postJson("/admin/vobiz-account/disconnect", { authId: "MA_TEST0002" }, ADMIN);
+  check("disconnecting an account succeeds", r.status === 200, r.status);
+  check("its token is deleted from disk and memory",
+    !fs.readFileSync(store, "utf8").includes("MA_TEST0002") && !vobizAccounts.knownAccount("MA_TEST0002"));
+  check("and its agents are signed out", vobizAccounts.sessionFor("nomatch") === null);
+  r = await postJson("/admin/vobiz-account/disconnect", { authId: "MA_TEST0002" }, ADMIN);
+  check("disconnecting it again is a 404", r.status === 404, r.status);
+
+  process.env.ALLOW_AGENT_AUTH_TOKEN = "true";
+  r = await postJson("/agent/vobiz-session", ACCT2, { Cookie: cookie });
+  check("ALLOW_AGENT_AUTH_TOKEN=true restores the old token sign-in, for a migration", r.status === 200, r.status);
+  check("no Auth Token appears in any HTTP response, admin replies included",
+    !seenResponses.some(t => t.includes(TOKENS.MA_TEST0001) || t.includes(TOKENS.MA_TEST0002)));
+}
+
 // --- Runner ----------------------------------------------------------------
 
 (async () => {
@@ -905,6 +1126,10 @@ async function testNoAgentsFile() {
     await testTabsAndManualDials(orgId, uris);
     await testInboundAnswerer();
     await testMicrophonePrompt();
+    await testMalformedRequests();
+    await testSoftphoneHardening(uris);
+    await testWebhookSignatures();
+    await testConnectedAccount();
     await testDisconnect(orgId);
     await testNoAgentsFile();
   } catch (err) {

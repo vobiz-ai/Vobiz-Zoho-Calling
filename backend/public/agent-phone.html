@@ -62,11 +62,13 @@
       <button type="button" id="modeSip" aria-pressed="false">SIP direct</button>
     </div>
     <div id="accountFields">
-      <div class="note">Your Vobiz Auth ID and Auth Token (Vobiz console, Account). The backend sets up your SIP line; the token stays in its memory and is never shown again.</div>
-      <label for="authId">Auth ID</label>
-      <input id="authId" autocomplete="off" spellcheck="false">
-      <label for="authToken">Auth Token</label>
-      <input id="authToken" type="password" autocomplete="off">
+      <div class="note" id="accountNote">Checking how to sign you in…</div>
+      <div id="tokenFields" hidden>
+        <label for="authId">Auth ID</label>
+        <input id="authId" autocomplete="off" spellcheck="false">
+        <label for="authToken">Auth Token</label>
+        <input id="authToken" type="password" autocomplete="off">
+      </div>
     </div>
     <div id="sipFields" hidden>
       <div class="note">An endpoint you already have. Its application's answer URL must be this backend's /answer. The SIP password stays in this browser.</div>
@@ -131,9 +133,21 @@ const HERE    = location.pathname.replace(/\/[^/]*$/, "");
 const BACKEND = (location.origin + HERE).replace(/\/+$/, "");
 let AGENT = null;
 const el = id => document.getElementById(id);
+/** Newest line first. Built from text nodes: whatever a message contains — a
+ *  caller name, a number from Zoho — is shown as text, never parsed as HTML. */
 const log = (msg, strong) => {
   const t = new Date().toTimeString().slice(0, 8);
-  el("log").insertAdjacentHTML("afterbegin", `${t}  ${strong ? `<b>${msg}</b>` : msg}\n`);
+  const line = document.createDocumentFragment();
+  line.append(`${t}  `);
+  if (strong) {
+    const b = document.createElement("b");
+    b.textContent = String(msg);
+    line.append(b);
+  } else {
+    line.append(String(msg));
+  }
+  line.append("\n");
+  el("log").prepend(line);
 };
 const setStatus = (text, state) => {
   el("status").textContent = text;
@@ -214,10 +228,31 @@ async function start() {
   el("who").textContent = agent.displayName || AGENT;
   // The SIP password is handed out once per Vobiz sign-in and kept only in
   // this page's memory, so every page load signs in to Vobiz again.
+  const how = agent.vobizSignIn || {};
+  connectedAccount = how.connectedAccount || null;
+  tokenAllowed = Boolean(how.agentTokenAllowed);
+  renderAccountMode();
   if (agent.vobiz && agent.vobiz.authId) el("authId").value = agent.vobiz.authId;
   if (agent.vobiz && agent.vobiz.mode === "sip") setMode("sip");
   showVobizLogin(true);
   setStatus("Sign in to Vobiz to start");
+}
+
+/**
+ * "Vobiz account" sign-in. Normally an admin has connected the account and
+ * there is nothing to type: the account's Auth Token — its master key — never
+ * comes near this page. Only a backend that explicitly allows the old way
+ * (ALLOW_AGENT_AUTH_TOKEN) shows the Auth ID and Auth Token fields.
+ */
+let connectedAccount = null;
+let tokenAllowed = false;
+function renderAccountMode() {
+  el("tokenFields").hidden = Boolean(connectedAccount) || !tokenAllowed;
+  el("accountNote").textContent = connectedAccount
+    ? `Your admin has connected your company's Vobiz account (${connectedAccount}). Sign in to start your phone line; you never need its Auth Token.`
+    : tokenAllowed
+      ? "Your Vobiz Auth ID and Auth Token (Vobiz console, Account). The backend sets up your SIP line; the token stays in its memory and is never shown again."
+      : "No Vobiz account is connected for you yet. Ask your admin to connect it, or use SIP direct.";
 }
 
 function showVobizLogin(on) {
@@ -270,13 +305,18 @@ async function signInSipDirect() {
 async function signInToVobiz(e) {
   e.preventDefault();
   if (mode === "sip") return signInSipDirect();
-  const authId = el("authId").value.trim();
-  const authToken = el("authToken").value.trim();
-  if (!authId || !authToken) return;
+  let payload = {};
+  if (!connectedAccount) {
+    if (!tokenAllowed) { log("no Vobiz account is connected for you yet — ask your admin, or use SIP direct", true); return; }
+    const authId = el("authId").value.trim();
+    const authToken = el("authToken").value.trim();
+    if (!authId || !authToken) return;
+    payload = { authId, authToken };
+  }
   el("vobizSignIn").disabled = true;
   setStatus("Checking your Vobiz account…");
   try {
-    const res = await postJson("/agent/vobiz-session", { authId, authToken });
+    const res = await postJson("/agent/vobiz-session", payload);
     const out = await res.json().catch(() => ({}));
     if (!res.ok) {
       setStatus(res.status === 401 ? "Vobiz did not accept those credentials" : "Vobiz sign-in failed", "err");
