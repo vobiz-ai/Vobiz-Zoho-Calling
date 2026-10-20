@@ -1256,7 +1256,7 @@ input,button{font-size:15px;padding:10px;width:100%;box-sizing:border-box;margin
 async function handleAdminSession(req, res) {
   const { token } = await readBody(req).catch(() => ({}));
   if (!auth.verifyAdminToken(token)) return sendJson(res, 401, { error: "wrong token" });
-  sendJson(res, 200, { ok: true, next: "/zoho/phonebridge/connect" }, { "Set-Cookie": auth.adminCookie(req) });
+  sendJson(res, 200, { ok: true, next: `${getPublicBaseUrl() || ""}/zoho/phonebridge/connect` }, { "Set-Cookie": auth.adminCookie(req) });
 }
 
 function handleAgentLinks(req, res) {

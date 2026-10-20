@@ -322,6 +322,17 @@ async function testTokenStore() {
 
 async function testRouteAuth() {
   console.log("\n[3] Route authentication and the earlier leaks");
+  {
+    // Several integrations can share one host, each under its own prefix.
+    const { cookiePathFor, createAuth } = require("./auth");
+    check("cookie path is the base URL's path", cookiePathFor("https://integrations.example.com/zoho/") === "/zoho");
+    check("cookie path is / at the root, or when unset", cookiePathFor("https://calling.example.com") === "/" && cookiePathFor(undefined) === "/");
+    const prefixed = createAuth({ appSecret: "x".repeat(32), adminToken: "t", publicBaseUrl: "https://integrations.example.com/zoho" });
+    const fakeReq = { socket: {}, headers: {} };
+    check("agent and admin cookies are scoped to /zoho",
+      /; Path=\/zoho;/.test(prefixed.agentCookie(fakeReq, "priya")) && /; Path=\/zoho;/.test(prefixed.adminCookie(fakeReq)));
+    check("signing out clears the cookie on the same path", /; Path=\/zoho;/.test(prefixed.clearAgentCookie()));
+  }
   let r = await req("/agent/priya");
   let body = await r.text();
   check("GET /agent/priya without a session is 401", r.status === 401, r.status);

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Runs under a path prefix
+
+- Session cookies are scoped to the path of `PUBLIC_BASE_URL` (for example
+  `/zoho`), so several services can share one host without seeing or
+  overwriting each other's sign-ins. At the root, nothing changes.
+- The admin sign-in response points to the connect URL under
+  `PUBLIC_BASE_URL`, prefix included.
+
 ### Call logging, recording setting, one tab per agent
 
 - Inbound calls are logged in Zoho against the agent who answered, learned
