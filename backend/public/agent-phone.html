@@ -739,28 +739,65 @@ function watchForInbound(from, callUuid) {
  * the phone line and tell every other tab when this one takes it.
  */
 let clickToDialSource = null;
+// The stream greets with a "hello" event at once. Some network paths hold a
+// stream back (Cloudflare's quick tunnels do), and then nothing arrives, not
+// even the greeting. Without it after STREAM_GREETING_MS, the page asks the
+// backend for its events every POLL_EVERY_MS instead.
+const STREAM_GREETING_MS = 4000;
+const POLL_EVERY_MS = 1500;
+
 function listenForClickToDial() {
   const src = clickToDialSource = new EventSource(`${BACKEND}/call-events?tab=${encodeURIComponent(TAB_ID)}`, { withCredentials: true });
+  let greeted = false;
   src.onopen = () => log("listening for Zoho click-to-dial");
   src.onerror = () => { if (clickToDialSource === src) log("click-to-dial stream dropped — retrying"); };
   src.onmessage = e => {
     if (clickToDialSource !== src) return;
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
-    if (ev.type === "dial" && ev.to) {
-      log(`Zoho asked for ${ev.to}`, true);
-      el("to").value = ev.to;
-      dial(ev.to, ev.callId);
-    }
-    if (ev.type === "dial-elsewhere") {
-      log(`Zoho asked for ${ev.to || "a number"} — dialled in your other softphone tab, the one with your phone line`, true);
-    }
-    if (ev.type === "inbound-routed") {
-      watchForInbound(ev.from, ev.callUuid);
-    }
-    if (ev.type === "signed-in-elsewhere") {
-      signedInElsewhere();
-    }
+    if (ev.type === "hello") { greeted = true; return; }
+    handleEvent(ev);
   };
+  setTimeout(() => { if (clickToDialSource === src && !greeted) pollForEvents(src); }, STREAM_GREETING_MS);
+}
+
+/** The stream is held back: close it, and fetch events with short requests. */
+function pollForEvents(src) {
+  try { src.close(); } catch {}
+  log("live updates are held back on this network path — checking for Zoho clicks every 1.5 s instead");
+  let stopped = false;
+  const poller = clickToDialSource = { close() { stopped = true; } };
+  const poll = async () => {
+    if (stopped || clickToDialSource !== poller) return;
+    try {
+      const res = await fetch(`${BACKEND}/call-events/poll?tab=${encodeURIComponent(TAB_ID)}`, { credentials: "same-origin", cache: "no-store" });
+      if (res.ok) {
+        for (const ev of (await res.json()).events || []) {
+          if (clickToDialSource !== poller) break;
+          handleEvent(ev);
+        }
+      }
+    } catch { /* the next poll tries again */ }
+    if (!stopped && clickToDialSource === poller) setTimeout(poll, POLL_EVERY_MS);
+  };
+  poll();
+}
+
+/** One event from the backend, by stream or by poll. */
+function handleEvent(ev) {
+  if (ev.type === "dial" && ev.to) {
+    log(`Zoho asked for ${ev.to}`, true);
+    el("to").value = ev.to;
+    dial(ev.to, ev.callId);
+  }
+  if (ev.type === "dial-elsewhere") {
+    log(`Zoho asked for ${ev.to || "a number"} — dialled in your other softphone tab, the one with your phone line`, true);
+  }
+  if (ev.type === "inbound-routed") {
+    watchForInbound(ev.from, ev.callUuid);
+  }
+  if (ev.type === "signed-in-elsewhere") {
+    signedInElsewhere();
+  }
 }
 
 function stopListening() {

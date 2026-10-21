@@ -373,6 +373,8 @@ Set these in `backend/.env` or in your host's environment.
 | `ZOHO_PB_SEND_MISSED_STATE` | No | off | `true` logs unanswered calls as missed instead of ended with duration 0. |
 | `ZOHO_PB_RECORDING_GRACE_MS` | No | `90000` | How long after a call ends to wait for its recording before logging the call without one. |
 | `CLICK_TO_DIAL_TIMEOUT_MS` | No | `120000` | How long a Zoho click waits for the softphone to place the call. A click that has not become a call by then is closed in Zoho as not connected. |
+| `SSE_KEEPALIVE_MS` | No | `25000` | How often an idle event stream to the softphone gets a keepalive comment, so a proxy does not close it as silent. |
+| `CALL_EVENTS_POLL_STALE_MS` | No | `15000` | How long a softphone that polls for its events counts as connected after its last poll. It polls when its network path holds the event stream back, as Cloudflare quick tunnels do. |
 | `RECORDING_URL_TTL_DAYS` | No | `30` | How long recording links in Zoho keep working. |
 | `RECORDING_URL_SECRET` | No | derived from `APP_SECRET` | Separate key for signing recording links. |
 | `ZOHO_PB_DEBUG` | No | off | `true` enables an admin-only PhoneBridge diagnostics route. Leave it off in production. |
@@ -425,6 +427,7 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | Register says `no agent in agents.json matches a Zoho user` | Emails or `zohoUser` IDs do not match. | Use the `zohoUsers` list in the response to fix `agents.json`, then register again. |
 | Clicking a number in Zoho fails with `AGENT_OFFLINE` | The agent's softphone tab is closed (the one holding their phone line), or they have not signed in to Vobiz there, or the backend restarted. | Open the softphone, sign in to Vobiz, wait for **Ready**, and keep the tab open. |
 | A clicked call shows in Zoho as not connected straight away | The softphone could not place it: it was not registered yet, the microphone was blocked, or the call failed before Vobiz answered. | Check the softphone's log for `call failed`, wait for **Ready**, and click again. |
+| Softphone log says `live updates are held back on this network path` | Something between the browser and the backend holds the event stream back. Cloudflare quick tunnels do. | Nothing to do. The softphone fetches its events every 1.5 seconds instead, so a Zoho click reaches it up to 1.5 seconds later. |
 | Clicking a number fails with `NO_CALLER_ID` | The Vobiz account has no active, voice-enabled number. | Add a number to the account and sign in again. |
 | Clicking a number fails with `INVALID_NUMBER` | The Zoho field holds something that is not a phone number (letters, for example). | Fix the number on the Zoho record. Spaces, dashes, dots and brackets are fine. |
 | Softphone shows **Not signed in** | The 12-hour agent session expired, or the link was never opened in this browser. | Open your sign-in link again. If it is rejected, ask the admin for a fresh one. |

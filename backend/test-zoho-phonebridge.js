@@ -1293,6 +1293,20 @@ async function testBaseline(uris) {
   check("WebRTC: session timers off, STUN on every call() and answer(), a user agent with no space",
     html.includes("session_timers: false") && (html.match(/iceServers: \[\{ urls: \["stun:/g) || []).length === 2 && /user_agent: "[^" ]+"/.test(html));
 
+  // An idle event stream gets keepalive comments, so a tunnel or proxy never
+  // closes it (Cloudflare drops a connection silent for about 100 s).
+  process.env.SSE_KEEPALIVE_MS = "50";
+  const keepCookie = await agentCookie("arjun");
+  const rawStream = await new Promise(resolve => {
+    let text = "";
+    const rq = http.get(`${B}/call-events?tab=tab-keepalive-0001`, { headers: { Cookie: keepCookie } }, res => {
+      res.on("data", c => { text += c; });
+      setTimeout(() => { rq.destroy(); resolve(text); }, 400);
+    });
+  });
+  delete process.env.SSE_KEEPALIVE_MS;
+  check("an idle event stream carries keepalive comments", (rawStream.match(/: keepalive/g) || []).length >= 2, rawStream);
+
   // Vobiz pages lists 20 at a time. An account with more than 20 applications
   // and endpoints must still find this integration's own, not make new ones.
   const acct2 = vobizState.MA_TEST0002;
@@ -1328,6 +1342,73 @@ async function testBaseline(uris) {
   acct2.apps.push(...savedApps);
 }
 
+async function testPolling(uris) {
+  console.log("\n[22] Where a network path holds the event stream back, the softphone polls instead");
+  const cookie = await agentCookie("priya");
+
+  // The stream greets at once, so the page can tell a held-back stream from a quiet one.
+  const greeting = await new Promise(resolve => {
+    let text = "";
+    const rq = http.get(`${B}/call-events?tab=tab-greet-00000001`, { headers: { Cookie: cookie } }, res => {
+      res.on("data", c => {
+        text += c;
+        if (text.includes('"hello"')) { rq.destroy(); resolve(text); }
+      });
+    });
+    setTimeout(() => { rq.destroy(); resolve(text); }, 1000);
+  });
+  check("the event stream greets with a hello event straight away", greeting.includes('data: {"type":"hello"}'), greeting);
+
+  const tab = "tab-poll-00000001";
+  let r = await req(`/call-events/poll?tab=${tab}`);
+  check("polling needs the agent's session", r.status === 401, r.status);
+  r = await req("/call-events/poll", { headers: { Cookie: cookie } });
+  check("and a tab id", r.status === 400, r.status);
+  r = await req(`/call-events/poll?tab=${tab}`, { headers: { Cookie: cookie } });
+  check("a first poll answers, with nothing queued", r.status === 200 && (await r.json()).events.length === 0);
+  r = await postJson("/agent/vobiz-session", { ...ACCT1, tabId: tab }, { Cookie: cookie });
+  check("the polling tab signs in and takes the line", r.status === 200, r.status);
+
+  received.length = 0;
+  r = await post(uris["600001"], { tonumber: "+910000900091", zohouser: "600001" });
+  const click = await r.json();
+  check("a click-to-dial is accepted while the line's tab is polling", r.status === 200, click);
+  r = await req(`/call-events/poll?tab=${tab}`, { headers: { Cookie: cookie } });
+  let events = (await r.json()).events;
+  check("the next poll hands the softphone the number and the call id", events.some(e => e.type === "dial" && e.to === "+910000900091" && e.callId === click.callid), events);
+  r = await req(`/call-events/poll?tab=${tab}`, { headers: { Cookie: cookie } });
+  check("each event is handed over once", (await r.json()).events.length === 0);
+  await postJson("/agent/call-failed", { callId: click.callid, cause: "test cleanup" }, { Cookie: cookie });
+  await waitFor(() => notifies().some(n => n.fields.id === click.callid && n.fields.state === "ended"));
+
+  // A tab whose stream is held back gives up on it and polls: its clicks come by poll.
+  const swapTab = "tab-swap-00000001";
+  const held = await openStream(cookie, swapTab);
+  await postJson("/agent/vobiz-session", { ...ACCT1, tabId: swapTab }, { Cookie: cookie });
+  await req(`/call-events/poll?tab=${swapTab}`, { headers: { Cookie: cookie } });
+  r = await post(uris["600001"], { tonumber: "+910000900093", zohouser: "600001" });
+  const click3 = await r.json();
+  r = await req(`/call-events/poll?tab=${swapTab}`, { headers: { Cookie: cookie } });
+  events = (await r.json()).events;
+  await tick();
+  check("once a tab polls, its clicks come by poll, never down the stream it gave up on",
+    r.status === 200 && events.some(e => e.type === "dial" && e.callId === click3.callid) && !held.events.some(e => e.type === "dial"), { events, stream: held.events });
+  held.close();
+  await postJson("/agent/call-failed", { callId: click3.callid, cause: "test cleanup" }, { Cookie: cookie });
+  await waitFor(() => notifies().some(n => n.fields.id === click3.callid && n.fields.state === "ended"));
+
+  // A polling tab that stops polling is no longer connected.
+  process.env.CALL_EVENTS_POLL_STALE_MS = "100";
+  await tick(250);
+  r = await post(uris["600001"], { tonumber: "+910000900092", zohouser: "600001" });
+  check("once it stops polling, a click is AGENT_OFFLINE, not queued for a tab that is gone", r.status === 409, r.status);
+  delete process.env.CALL_EVENTS_POLL_STALE_MS;
+
+  const html = await (await req("/agent-phone")).text();
+  check("the page falls back to polling when the stream's greeting does not come",
+    html.includes("pollForEvents(src)") && html.includes("/call-events/poll?tab=") && html.includes('ev.type === "hello"'));
+}
+
 // --- Runner ----------------------------------------------------------------
 
 (async () => {
@@ -1354,6 +1435,7 @@ async function testBaseline(uris) {
     await testWebhookSignatures();
     await testConnectedAccount();
     await testBaseline(uris);
+    await testPolling(uris);
     await testDisconnect(orgId);
     await testNoAgentsFile();
   } catch (err) {
