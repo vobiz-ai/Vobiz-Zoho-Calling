@@ -44,12 +44,22 @@ function safeEqual(a, b) {
   return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y);
 }
 
+/**
+ * A cookie whose value is not valid percent-encoding ("50%", "%E0%A4" — any
+ * other app on the same host can set one) is skipped. decodeURIComponent
+ * throws on it, and this runs on every request, outside any handler's error
+ * handling, so a throw here used to take the whole process down.
+ */
 function parseCookies(header) {
   const out = {};
   for (const part of String(header || "").split(";")) {
     const i = part.indexOf("=");
     if (i < 0) continue;
-    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    try {
+      out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    } catch {
+      // Not ours, and not readable: ignore it.
+    }
   }
   return out;
 }

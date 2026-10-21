@@ -62,11 +62,13 @@
       <button type="button" id="modeSip" aria-pressed="false">SIP direct</button>
     </div>
     <div id="accountFields">
-      <div class="note">Your Vobiz Auth ID and Auth Token (Vobiz console, Account). The backend sets up your SIP line; the token stays in its memory and is never shown again.</div>
-      <label for="authId">Auth ID</label>
-      <input id="authId" autocomplete="off" spellcheck="false">
-      <label for="authToken">Auth Token</label>
-      <input id="authToken" type="password" autocomplete="off">
+      <div class="note" id="accountNote">Checking how to sign you in…</div>
+      <div id="tokenFields" hidden>
+        <label for="authId">Auth ID</label>
+        <input id="authId" autocomplete="off" spellcheck="false">
+        <label for="authToken">Auth Token</label>
+        <input id="authToken" type="password" autocomplete="off">
+      </div>
     </div>
     <div id="sipFields" hidden>
       <div class="note">An endpoint you already have. Its application's answer URL must be this backend's /answer. The SIP password stays in this browser.</div>
@@ -130,10 +132,31 @@
 const HERE    = location.pathname.replace(/\/[^/]*$/, "");
 const BACKEND = (location.origin + HERE).replace(/\/+$/, "");
 let AGENT = null;
+// Tells this tab apart from the agent's other softphone tabs, so the backend
+// can tell the others when this one takes the phone line. New on every page
+// load, never stored.
+const TAB_ID = typeof crypto.randomUUID === "function"
+  ? crypto.randomUUID()
+  : Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
+// How long a call, in either direction, waits for network candidates after the
+// first one before sending its SDP anyway. See capIceGathering().
+const ICE_CAP_MS = 2500;
 const el = id => document.getElementById(id);
+/** Newest line first. Built from text nodes: whatever a message contains — a
+ *  caller name, a number from Zoho — is shown as text, never parsed as HTML. */
 const log = (msg, strong) => {
   const t = new Date().toTimeString().slice(0, 8);
-  el("log").insertAdjacentHTML("afterbegin", `${t}  ${strong ? `<b>${msg}</b>` : msg}\n`);
+  const line = document.createDocumentFragment();
+  line.append(`${t}  `);
+  if (strong) {
+    const b = document.createElement("b");
+    b.textContent = String(msg);
+    line.append(b);
+  } else {
+    line.append(String(msg));
+  }
+  line.append("\n");
+  el("log").prepend(line);
 };
 const setStatus = (text, state) => {
   el("status").textContent = text;
@@ -214,10 +237,31 @@ async function start() {
   el("who").textContent = agent.displayName || AGENT;
   // The SIP password is handed out once per Vobiz sign-in and kept only in
   // this page's memory, so every page load signs in to Vobiz again.
+  const how = agent.vobizSignIn || {};
+  connectedAccount = how.connectedAccount || null;
+  tokenAllowed = Boolean(how.agentTokenAllowed);
+  renderAccountMode();
   if (agent.vobiz && agent.vobiz.authId) el("authId").value = agent.vobiz.authId;
   if (agent.vobiz && agent.vobiz.mode === "sip") setMode("sip");
   showVobizLogin(true);
   setStatus("Sign in to Vobiz to start");
+}
+
+/**
+ * "Vobiz account" sign-in. Normally an admin has connected the account and
+ * there is nothing to type: the account's Auth Token — its master key — never
+ * comes near this page. Only a backend that explicitly allows the old way
+ * (ALLOW_AGENT_AUTH_TOKEN) shows the Auth ID and Auth Token fields.
+ */
+let connectedAccount = null;
+let tokenAllowed = false;
+function renderAccountMode() {
+  el("tokenFields").hidden = Boolean(connectedAccount) || !tokenAllowed;
+  el("accountNote").textContent = connectedAccount
+    ? `Your admin has connected your company's Vobiz account (${connectedAccount}). Sign in to start your phone line; you never need its Auth Token.`
+    : tokenAllowed
+      ? "Your Vobiz Auth ID and Auth Token (Vobiz console, Account). The backend sets up your SIP line; the token stays in its memory and is never shown again."
+      : "No Vobiz account is connected for you yet. Ask your admin to connect it, or use SIP direct.";
 }
 
 function showVobizLogin(on) {
@@ -249,7 +293,7 @@ async function signInSipDirect() {
   el("vobizSignIn").disabled = true;
   try {
     // Only the username and caller ID go to the backend.
-    const res = await postJson("/agent/sip-session", { sipUser, callerId });
+    const res = await postJson("/agent/sip-session", { sipUser, callerId, tabId: TAB_ID });
     const out = await res.json().catch(() => ({}));
     if (!res.ok) { setStatus("SIP sign-in refused", "err"); log(out.error || `sign-in failed (${res.status})`, true); return; }
     el("sipPassword").value = "";
@@ -270,13 +314,18 @@ async function signInSipDirect() {
 async function signInToVobiz(e) {
   e.preventDefault();
   if (mode === "sip") return signInSipDirect();
-  const authId = el("authId").value.trim();
-  const authToken = el("authToken").value.trim();
-  if (!authId || !authToken) return;
+  let payload = {};
+  if (!connectedAccount) {
+    if (!tokenAllowed) { log("no Vobiz account is connected for you yet — ask your admin, or use SIP direct", true); return; }
+    const authId = el("authId").value.trim();
+    const authToken = el("authToken").value.trim();
+    if (!authId || !authToken) return;
+    payload = { authId, authToken };
+  }
   el("vobizSignIn").disabled = true;
   setStatus("Checking your Vobiz account…");
   try {
-    const res = await postJson("/agent/vobiz-session", { authId, authToken });
+    const res = await postJson("/agent/vobiz-session", { ...payload, tabId: TAB_ID });
     const out = await res.json().catch(() => ({}));
     if (!res.ok) {
       setStatus(res.status === 401 ? "Vobiz did not accept those credentials" : "Vobiz sign-in failed", "err");
@@ -290,7 +339,6 @@ async function signInToVobiz(e) {
     showLineCard("account");
     el("who").textContent = `${agent.displayName || AGENT} · ${out.authId} · ${out.sipUser}`;
     if (out.applicationBound === false) log("the SIP endpoint could not be bound to the application — outbound calls may not connect", true);
-    if (out.reusedSession) log("you are signed in in another tab too — this tab shares its line; Zoho click-to-dial goes to the tab opened last", true);
     startPhone(out.sipUser, out.sipPassword);
     requestMicrophone();
   } catch (err) {
@@ -365,19 +413,57 @@ async function enableInbound() {
   log(res.ok ? `inbound calls on ${out.number} now ring signed-in agents (moved off ${appLabel(out.previousApplicationName, out.previousApplicationId)})` : (out.error || "could not enable inbound calls"), true);
 }
 
-async function signOutOfVobiz() {
-  try { ua && ua.stop(); } catch {}
+/** Stop the phone. Events from the stopped UA no longer change the status. */
+function stopPhone() {
+  const old = ua;
   ua = null;
   setRegistered(false);
+  try { old && old.stop(); } catch {}
+}
+
+async function signOutOfVobiz() {
+  stopPhone();
+  stopListening();
   await postJson("/agent/vobiz-logout").catch(() => {});
   showVobizLogin(true);
   setStatus("Signed out of Vobiz");
 }
 
+/**
+ * The agent signed in to Vobiz in another tab, and that tab now holds the
+ * phone line: Vobiz keeps one registration per endpoint, and that sign-in gave
+ * the endpoint a new SIP password, so this tab's can no longer register. Stop
+ * this tab's phone and its event stream — after the call in progress, if there
+ * is one — and offer to sign in here again.
+ */
+let lineMovedAway = false;
+function signedInElsewhere() {
+  stopListening();
+  log("you signed in to Vobiz in another tab — that tab has your phone line now", true);
+  if (session) {
+    lineMovedAway = true;
+    log("this call carries on; the phone in this tab stops when it ends", true);
+    return;
+  }
+  stopForOtherTab();
+}
+
+function stopForOtherTab() {
+  lineMovedAway = false;
+  stopPhone();
+  showVobizLogin(true);
+  setStatus("Signed in in another tab — sign in again to use this one", "err");
+}
+
+/** After a call ends: hand the line over if another tab took it meanwhile. */
+function afterCall() {
+  if (lineMovedAway) stopForOtherTab();
+}
+
 function startPhone(sipUser, sipPassword) {
   setStatus("Connecting…");
 
-  ua = new JsSIP.UA({
+  const phone = ua = new JsSIP.UA({
     sockets: [new JsSIP.WebSocketInterface("wss://registrar.vobiz.ai:5063/")],
     uri: `sip:${sipUser}`,
     password: sipPassword,
@@ -392,15 +478,20 @@ function startPhone(sipUser, sipPassword) {
     user_agent: "VobizZohoAgentPhone/1.0.0",
   });
 
-  ua.on("connected",    () => log("websocket connected"));
-  ua.on("disconnected", () => { setStatus("Disconnected", "err"); setRegistered(false); });
-  ua.on("registered",   () => {
+  // A stopped UA (signed out, or the line moved to another tab) still fires a
+  // few events while it shuts down; only the live one may change the status.
+  const live = () => ua === phone;
+  phone.on("connected",    () => { if (live()) log("websocket connected"); });
+  phone.on("disconnected", () => { if (!live()) return; setStatus("Disconnected", "err"); setRegistered(false); });
+  phone.on("registered",   () => {
+    if (!live()) return;
     if (micBlocked) setStatus("Registered, but the microphone is blocked — allow it and reload", "err");
     else setStatus(`Ready — ${agent.displayName || AGENT}`, "on");
     setRegistered(true); log("registered", true);
   });
-  ua.on("unregistered", () => { setStatus("Not registered", "err"); setRegistered(false); });
-  ua.on("registrationFailed", e => {
+  phone.on("unregistered", () => { if (!live()) return; setStatus("Not registered", "err"); setRegistered(false); });
+  phone.on("registrationFailed", e => {
+    if (!live()) return;
     setStatus(`Registration failed: ${(e && e.cause) || "unknown"}`, "err");
     setRegistered(false);
     log(`registration failed — ${(e && e.cause) || "unknown"}`, true);
@@ -409,8 +500,8 @@ function startPhone(sipUser, sipPassword) {
   // Inbound: a PSTN caller reached the DID and the backend bridged to <User>.
   // The call rings and waits for the agent. The <Dial> on the backend gives
   // them 20 seconds; after that the caller hears voicemail.
-  ua.on("newRTCSession", ({ originator, session: s }) => {
-    if (originator !== "remote") return;
+  phone.on("newRTCSession", ({ originator, session: s }) => {
+    if (originator !== "remote" || !live()) return;
     clearInboundWatch();
 
     const caller = callerOf(s);
@@ -426,12 +517,57 @@ function startPhone(sipUser, sipPassword) {
     s.on("failed", e => endRing(`call ended — ${(e && e.cause) || "cancelled"}`));
   });
 
-  ua.start();
+  phone.start();
   if (!clickToDialSource) listenForClickToDial();
 }
 
-function dial(number) {
-  if (!registered) { log("not registered yet", true); return; }
+/**
+ * Send the SDP once ICE has what it needs, not when the browser has finished
+ * gathering on every network interface. On a machine with interfaces that
+ * cannot reach the STUN server that is up to ~40 s of STUN retries — longer
+ * than a caller waits, and longer than an inbound call is allowed to ring.
+ * JsSIP hands every candidate a `ready` callback for exactly this; calling it
+ * settles the SDP. One reflexive (public) candidate is all Vobiz's media
+ * server needs, so the SDP goes at the first one, or ICE_CAP_MS after the
+ * first candidate of any kind, whichever comes first.
+ */
+function capIceGathering(s, label) {
+  let started = null;
+  let settled = false;
+  let lastReady = null;
+
+  const go = why => {
+    if (settled || !lastReady) return;
+    settled = true;
+    console.info(`[Vobiz] ${label}: sending after ${Date.now() - started} ms of gathering (${why})`);
+    try { lastReady(); } catch { /* gathering already finished on its own */ }
+  };
+
+  s.on("icecandidate", (e = {}) => {
+    const { candidate, ready } = e;
+    lastReady = ready || lastReady;
+    if (started === null) {
+      // Timed from the first candidate, not from the call: the microphone and
+      // the offer come first, and they are not ICE's to wait for.
+      started = Date.now();
+      setTimeout(() => go("gathering took too long"), ICE_CAP_MS);
+    }
+    const c = (candidate && candidate.candidate) || "";
+    if ((candidate && candidate.type === "srflx") || c.includes(" typ srflx")) go("have a reflexive candidate");
+  });
+}
+
+/**
+ * Place a call. `callId` is set when Zoho asked for it (click-to-dial): if
+ * this tab cannot place it, the backend is told, so Zoho closes the call as
+ * not connected instead of leaving it ringing. JsSIP fires `failed` — not
+ * `ended` — for every call that never connected, so that is where it is caught.
+ */
+function dial(number, callId) {
+  const report = cause => {
+    if (callId) postJson("/agent/call-failed", { callId, cause }).catch(() => {});
+  };
+  if (!registered) { log("not registered yet", true); report("not registered"); return; }
   const target = `sip:${String(number).replace(/[^\d+]/g, "")}@registrar.vobiz.ai`;
   log(`dialling ${number}`, true);
   setStatus(`Calling ${number}…`);
@@ -450,21 +586,26 @@ function dial(number) {
   } catch (err) {
     setStatus("Could not start the call", "err");
     log(`call failed to start — ${err.message}`, true);
+    report("could not start");
     return;
   }
 
   attachAudio(session);
+  capIceGathering(session, "call");
   showInCall(true);
   session.on("progress",  () => setStatus(`Ringing ${number}…`));
   session.on("confirmed", () => { setStatus(`On a call with ${number}`, "on"); log("answered", true); });
   session.on("failed",    e => {
     setStatus(`Call failed — ${(e && e.cause) || "unknown"}`, "err");
     log(`call failed — ${(e && e.cause) || "unknown"}`, true);
+    report((e && e.cause) || "failed");
     session = null; showInCall(false);
+    afterCall();
   });
   session.on("ended", () => {
     setStatus(`Ready`, "on"); log("call ended", true);
     session = null; showInCall(false);
+    afterCall();
   });
 }
 
@@ -490,6 +631,7 @@ function endRing(reason) {
   session = null;
   if (reason) log(reason, true);
   if (registered) setStatus("Ready", "on");
+  afterCall();
 }
 
 /** A ringtone, synthesised — no asset to ship or fail to load. */
@@ -530,6 +672,7 @@ function acceptCall() {
     // against them, and the leg is torn down without connecting — the browser
     // rings, the CDR shows a B leg billed 0s, and nothing says why. Vobiz's own
     // SDK sets these on the incoming answer too.
+    capIceGathering(session, "answer");
     session.answer({
       mediaConstraints: { audio: true, video: false },
       pcConfig: { iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }] },
@@ -590,26 +733,40 @@ function watchForInbound(from, callUuid) {
   }, INBOUND_GRACE_MS);
 }
 
-/** Zoho click-to-dial arrives at the backend, which relays it here. */
+/**
+ * Zoho click-to-dial arrives at the backend, which relays it here. The stream
+ * names this tab (?tab=), so the backend can send a click to the tab that holds
+ * the phone line and tell every other tab when this one takes it.
+ */
 let clickToDialSource = null;
 function listenForClickToDial() {
-  const src = clickToDialSource = new EventSource(`${BACKEND}/call-events`, { withCredentials: true });
+  const src = clickToDialSource = new EventSource(`${BACKEND}/call-events?tab=${encodeURIComponent(TAB_ID)}`, { withCredentials: true });
   src.onopen = () => log("listening for Zoho click-to-dial");
-  src.onerror = () => log("click-to-dial stream dropped — retrying");
+  src.onerror = () => { if (clickToDialSource === src) log("click-to-dial stream dropped — retrying"); };
   src.onmessage = e => {
+    if (clickToDialSource !== src) return;
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
     if (ev.type === "dial" && ev.to) {
       log(`Zoho asked for ${ev.to}`, true);
       el("to").value = ev.to;
-      dial(ev.to);
+      dial(ev.to, ev.callId);
     }
     if (ev.type === "dial-elsewhere") {
-      log(`Zoho asked for ${ev.to || "a number"} — dialled in your other softphone tab (the one opened last)`, true);
+      log(`Zoho asked for ${ev.to || "a number"} — dialled in your other softphone tab, the one with your phone line`, true);
     }
     if (ev.type === "inbound-routed") {
       watchForInbound(ev.from, ev.callUuid);
     }
+    if (ev.type === "signed-in-elsewhere") {
+      signedInElsewhere();
+    }
   };
+}
+
+function stopListening() {
+  const src = clickToDialSource;
+  clickToDialSource = null;
+  try { src && src.close(); } catch {}
 }
 
 el("vobizLogin").addEventListener("submit", signInToVobiz);

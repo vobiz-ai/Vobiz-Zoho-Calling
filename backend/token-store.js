@@ -24,6 +24,10 @@
  * Put the file on a disk that survives a restart (DATA_DIR). That, not an
  * environment variable holding one refresh token, is what keeps every
  * connected org across a redeploy.
+ *
+ * The same store, with its own file and secret field, holds the Auth Token of
+ * each Vobiz account an admin connected (vobiz-accounts.json, sealed field
+ * `authToken`, bound to the Auth ID).
  */
 
 const fs = require("fs");
@@ -67,11 +71,14 @@ const isSealed = v => typeof v === "string" && v.startsWith(PREFIX);
 
 /**
  * @param {object} opts
- * @param {string} opts.file   where the store lives
- * @param {string} [opts.key]  raw TOKEN_ENCRYPTION_KEY; read from env when omitted
+ * @param {string} [opts.file]          where the store lives (overrides fileName)
+ * @param {string} [opts.fileName]      file name under DATA_DIR, read at call time
+ * @param {string} [opts.key]           raw TOKEN_ENCRYPTION_KEY; read from env when omitted
+ * @param {string[]} [opts.secretFields] fields sealed on disk
+ * @param {string} [opts.idField]       field that repeats the record's own id
  */
-function createTokenStore({ file, key } = {}) {
-  const filePath = () => file || path.join(process.env.DATA_DIR || __dirname, "zoho-orgs.json");
+function createTokenStore({ file, fileName = "zoho-orgs.json", key, secretFields = SECRET_FIELDS, idField = "orgId" } = {}) {
+  const filePath = () => file || path.join(process.env.DATA_DIR || __dirname, fileName);
   const keyBuf = () => parseKey(key || process.env.TOKEN_ENCRYPTION_KEY);
 
   function readRaw() {
@@ -95,7 +102,7 @@ function createTokenStore({ file, key } = {}) {
   function decryptRecord(orgId, rec) {
     if (!rec) return null;
     const out = { ...rec };
-    for (const field of SECRET_FIELDS) {
+    for (const field of secretFields) {
       const v = rec[field];
       if (v == null) continue;
       if (isSealed(v)) {
@@ -113,7 +120,7 @@ function createTokenStore({ file, key } = {}) {
 
   function encryptRecord(orgId, rec) {
     const out = { ...rec };
-    for (const field of SECRET_FIELDS) {
+    for (const field of secretFields) {
       const v = rec[field];
       if (v == null || v === "") continue;
       out[field] = seal(v, keyBuf(), `${orgId}|${field}`);
@@ -129,11 +136,11 @@ function createTokenStore({ file, key } = {}) {
       return Object.prototype.hasOwnProperty.call(all, orgId) ? decryptRecord(orgId, all[orgId]) : null;
     },
     put(orgId, patch) {
-      if (!orgId || typeof orgId !== "string") throw new Error("orgId is required");
+      if (!orgId || typeof orgId !== "string") throw new Error(`${idField} is required`);
       keyBuf(); // fail before touching the file when no key is configured
       const all = readRaw();
       const existing = Object.prototype.hasOwnProperty.call(all, orgId) ? decryptRecord(orgId, all[orgId]) : {};
-      const merged = { ...existing, ...patch, orgId, updatedAt: new Date().toISOString() };
+      const merged = { ...existing, ...patch, [idField]: orgId, updatedAt: new Date().toISOString() };
       all[orgId] = encryptRecord(orgId, merged);
       writeRaw(all);
       return merged;
@@ -149,7 +156,7 @@ function createTokenStore({ file, key } = {}) {
     listPublic() {
       return Object.values(readRaw()).map(rec => {
         const out = { ...rec };
-        for (const field of SECRET_FIELDS) delete out[field];
+        for (const field of secretFields) delete out[field];
         return out;
       });
     },
