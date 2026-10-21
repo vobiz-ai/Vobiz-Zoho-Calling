@@ -164,8 +164,20 @@ const vobizState = {
   MA_TEST0002: { numbers: ["+910000000003"], apps: [], endpoints: {} },
 };
 let endpointSeq = 9000;
+// When set, Create Application is refused with this reason, as Vobiz does.
+let vobizCreateAppError = null;
 const bareIds = text => text.replace(/"app_id":"(\d{16,})"/g, '"app_id":$1');
 const vjson = (status, obj) => new Response(bareIds(JSON.stringify(obj)), { status, headers: { "Content-Type": "application/json" } });
+// Lists page the way Vobiz does: 20 at a time, whatever `limit` asks for.
+const VOBIZ_PAGE = 20;
+const vpage = (u, all) => {
+  const offset = Number(u.searchParams.get("offset") || 0);
+  const more = offset + VOBIZ_PAGE < all.length;
+  return vjson(200, {
+    meta: { limit: VOBIZ_PAGE, offset, next: more ? `${u.pathname}?limit=${VOBIZ_PAGE}&offset=${offset + VOBIZ_PAGE}` : null, total_count: all.length },
+    objects: all.slice(offset, offset + VOBIZ_PAGE),
+  });
+};
 
 function vobizMock(target, init) {
   const method = (init.method || "GET").toUpperCase();
@@ -192,17 +204,15 @@ function vobizMock(target, init) {
     const page = Number(u.searchParams.get("page") || 1);
     return vjson(200, { items: all.slice((page - 1) * per, page * per), page, per_page: per, total: all.length });
   }
-  if (method === "GET" && rest === "/Application/") {
-    return vjson(200, { meta: { limit: 100, offset: 0, next: null, total_count: acct.apps.length }, objects: acct.apps });
-  }
+  if (method === "GET" && rest === "/Application/") return vpage(u, acct.apps);
   if (method === "POST" && rest === "/Application/") {
+    if (vobizCreateAppError) return vjson(400, { error: vobizCreateAppError });
     const b = JSON.parse(body);
     acct.apps.push({ app_id: NEW_APP_2, app_name: b.app_name, answer_url: b.answer_url, hangup_url: b.hangup_url });
     return vjson(201, { api_id: "x", app_id: NEW_APP_2, message: "created" });
   }
   if (method === "GET" && rest === "/Endpoint/") {
-    const objects = Object.values(acct.endpoints).map(e => ({ endpoint_id: e.endpoint_id, username: e.username, alias: e.alias }));
-    return vjson(200, { meta: { limit: 100, offset: 0, next: null, total_count: objects.length }, objects });
+    return vpage(u, Object.values(acct.endpoints).map(e => ({ endpoint_id: e.endpoint_id, username: e.username, alias: e.alias })));
   }
   if (method === "POST" && rest === "/Endpoint/") {
     const b = JSON.parse(body);
@@ -1282,6 +1292,40 @@ async function testBaseline(uris) {
     html.includes('capIceGathering(session, "call");') && /capIceGathering\(session, "answer"\);\s*session\.answer\(/.test(html));
   check("WebRTC: session timers off, STUN on every call() and answer(), a user agent with no space",
     html.includes("session_timers: false") && (html.match(/iceServers: \[\{ urls: \["stun:/g) || []).length === 2 && /user_agent: "[^" ]+"/.test(html));
+
+  // Vobiz pages lists 20 at a time. An account with more than 20 applications
+  // and endpoints must still find this integration's own, not make new ones.
+  const acct2 = vobizState.MA_TEST0002;
+  const fillerApps = Array.from({ length: 25 }, (_, i) => ({ app_id: `6000000000000${String(i).padStart(4, "0")}`, app_name: `filler-${i}`, answer_url: `https://other.example/${i}` }));
+  acct2.apps.unshift(...fillerApps);
+  const fillerEndpoints = {};
+  for (let i = 0; i < 25; i += 1) fillerEndpoints[String(100 + i)] = { endpoint_id: String(100 + i), username: `filler${i}`, alias: `filler-${i}`, password: "x", app: null };
+  Object.assign(acct2.endpoints, fillerEndpoints);
+  const storeAll = JSON.parse(fs.readFileSync(vobizAccounts.storeFile(), "utf8"));
+  const ownEndpoint = storeAll["MA_TEST0002:nomatch"];
+  delete storeAll["MA_TEST0002:nomatch"];
+  fs.writeFileSync(vobizAccounts.storeFile(), JSON.stringify(storeAll));
+  const appsBefore = acct2.apps.length;
+  const endpointsBefore = Object.keys(acct2.endpoints).length;
+  r = await postJson("/agent/vobiz-session", ACCT2, { Cookie: await agentCookie("nomatch") });
+  const paged = await r.json();
+  check("with more than 20 applications, ours is found on a later page and not created again",
+    r.status === 200 && paged.applicationId === NEW_APP_2 && acct2.apps.length === appsBefore, { status: r.status, app: paged.applicationId, apps: acct2.apps.length, before: appsBefore });
+  check("with more than 20 endpoints, the agent's own is found by alias on a later page and reused",
+    r.status === 200 && ownEndpoint && paged.sipUser === `${ownEndpoint.username}@registrar.vobiz.ai` && Object.keys(acct2.endpoints).length === endpointsBefore,
+    { sipUser: paged.sipUser, own: ownEndpoint, endpoints: Object.keys(acct2.endpoints).length, before: endpointsBefore });
+  acct2.apps.splice(0, fillerApps.length);
+  for (const id of Object.keys(fillerEndpoints)) delete acct2.endpoints[id];
+
+  // When Vobiz refuses to create the application, its reason is passed on.
+  const savedApps = acct2.apps.splice(0);
+  vobizCreateAppError = "answer_url is not a valid URL";
+  r = await postJson("/agent/vobiz-session", ACCT2, { Cookie: await agentCookie("nomatch") });
+  const refused = await r.json();
+  check("a refused application create names Vobiz's reason and the address to check",
+    r.status === 400 && /answer_url is not a valid URL/.test(refused.error) && refused.error.includes("https://example.test"), refused);
+  vobizCreateAppError = null;
+  acct2.apps.push(...savedApps);
 }
 
 // --- Runner ----------------------------------------------------------------
