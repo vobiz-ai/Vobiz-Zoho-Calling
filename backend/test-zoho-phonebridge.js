@@ -217,7 +217,8 @@ function vobizMock(target, init) {
     const ep = acct.endpoints[em[1]];
     if (!ep) return new Response("", { status: 404 });
     if (method === "GET") {
-      return vjson(200, { endpoint_id: ep.endpoint_id, username: ep.username, alias: ep.alias, application: ep.app ? { app_id: ep.app } : null });
+      // Vobiz gives the binding as the application's resource URI.
+      return vjson(200, { endpoint_id: ep.endpoint_id, username: ep.username, alias: ep.alias, application: ep.app ? `/v1/Account/${authId}/Application/${ep.app}/` : null });
     }
     // MA_TEST0001 behaves as documented ("application", integer) and ignores
     // "app_id"; MA_TEST0002 takes "app_id" as a string, as the playground sends.
@@ -509,6 +510,7 @@ async function testClickToDial(orgId, uris) {
 
   const phone = priyaPhone = await openSoftphone("priya", { ...ACCT1, callerId: "+910000000002" });
   check("priya signs in with Vobiz account MA_TEST0001", phone.status === 200 && phone.vobiz.authId === "MA_TEST0001" && Boolean(phone.vobiz.sipPassword), phone.vobiz);
+  check("the endpoint's binding is read back from Vobiz's resource-URI form (no false 'could not be bound')", phone.vobiz.applicationBound === true, phone.vobiz.applicationBound);
   check("the caller ID list is every page of active, voice-enabled numbers", JSON.stringify(phone.vobiz.numbers.map(n => n.e164)) === JSON.stringify(["+910000000001", "+910000000002"]), phone.vobiz.numbers);
   check("each number says which application answers it", phone.vobiz.numbers.every(n => n.applicationId === OUR_APP_1));
   r = await postJson("/agent/caller-id", { callerId: "+910000000099" }, { Cookie: phone.cookie });
@@ -573,6 +575,7 @@ async function testClickToDial(orgId, uris) {
   // Zoho says another mapped user clicked a URI registered for priya: route to that user's agent.
   arjunPhone = await openSoftphone("arjun", ACCT2);
   check("arjun signs in with a different account, MA_TEST0002", arjunPhone.status === 200 && arjunPhone.vobiz.authId === "MA_TEST0002", arjunPhone.vobiz);
+  check("and his endpoint is reported bound too (the app_id bind)", arjunPhone.vobiz.applicationBound === true, arjunPhone.vobiz.applicationBound);
   await tick();
   r = await post(uris["600001"], { tonumber: "+910000900002", zohouser: "600002" });
   await waitFor(() => arjunPhone.events.some(e => e.type === "dial"));

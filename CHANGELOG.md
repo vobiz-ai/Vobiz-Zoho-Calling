@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Found in live testing
 
 - **Answer XML is well-formed.** The `&` between query parameters in `callbackUrl`/`action` attributes is now escaped as `&amp;`. Unescaped, Vobiz rejected the whole answer (hangup cause 8011, "Invalid Answer XML") and every call failed as Busy.
+- **The endpoint binding is read from Vobiz's resource URI.** `application` comes back as `/v1/Account/<id>/Application/<appId>/`, so the softphone no longer warns that the endpoint "could not be bound" when it was.
 
 ### Integration baseline: one phone line per agent, every outcome logged, hardened callbacks, CI
 

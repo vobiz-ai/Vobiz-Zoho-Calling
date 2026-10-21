@@ -314,10 +314,16 @@ async function createEndpoint(authId, authToken, agentId, password) {
  */
 async function bindEndpoint(authId, authToken, endpointId, appId) {
   if (!isDigits(appId)) throw new VobizApiError("application id is not numeric", 500);
+  // Vobiz reports the binding as the application's resource URI,
+  // "/v1/Account/<authId>/Application/<appId>/"; a bare id or an object with
+  // app_id are read too.
   const boundId = r => {
     const app = r.json && r.json.application;
     if (app && typeof app === "object" && app.app_id != null) return String(app.app_id);
-    if (app != null && typeof app !== "object") return String(app);
+    if (app != null && typeof app !== "object") {
+      const m = String(app).match(/\/Application\/(\d+)\/?$/);
+      return m ? m[1] : String(app);
+    }
     return r.json && r.json.app_id != null ? String(r.json.app_id) : "";
   };
   await vobiz(authId, authToken, "POST", `/Endpoint/${encodeURIComponent(endpointId)}/`, '{"app_id":"' + appId + '"}');
