@@ -235,7 +235,9 @@ async function findOrCreateApplication(authId, authToken, publicBaseUrl) {
   const answerUrl = `${publicBaseUrl}/answer`;
   const names = {};
   let found = null;
-  for (let offset = 0, pages = 0; pages < 20; pages += 1, offset += 100) {
+  // Vobiz returns at most 20 per page whatever `limit` asks for, so the next
+  // page starts after what actually came back.
+  for (let offset = 0, pages = 0; pages < 100; pages += 1) {
     const r = await vobiz(authId, authToken, "GET", `/Application/?limit=100&offset=${offset}`);
     if (!r.ok) throw new VobizApiError(`listing applications failed (${r.status})`, r.status);
     const objects = Array.isArray(r.json.objects) ? r.json.objects : [];
@@ -245,6 +247,7 @@ async function findOrCreateApplication(authId, authToken, publicBaseUrl) {
     const hit = objects.find(a => a && a.answer_url === answerUrl && isDigits(a.app_id));
     if (hit && !found) found = String(hit.app_id);
     if (!r.json.meta || !r.json.meta.next || objects.length === 0) break;
+    offset += objects.length;
   }
   if (found) return { appId: found, names };
   const body = JSON.stringify({
@@ -256,7 +259,12 @@ async function findOrCreateApplication(authId, authToken, publicBaseUrl) {
   });
   const r = await vobiz(authId, authToken, "POST", "/Application/", body);
   const appId = r.json.app_id != null ? String(r.json.app_id) : "";
-  if (!r.ok || !isDigits(appId)) throw new VobizApiError(`creating the application failed (${r.status})`, r.status || 502);
+  if (!r.ok || !isDigits(appId)) {
+    // Vobiz's own reason, e.g. "answer_url is not a valid URL" — which is what
+    // it says when PUBLIC_BASE_URL does not resolve (a tunnel that has gone).
+    const reason = r.json && typeof r.json.error === "string" ? `: ${r.json.error.slice(0, 200)}` : "";
+    throw new VobizApiError(`creating the application failed (${r.status})${reason} — check that ${publicBaseUrl} is up and reachable`, r.status || 502);
+  }
   console.log(`[vobiz] ${authId}: created application ${appId} -> ${answerUrl}`);
   names[appId] = APP_NAME;
   return { appId, names };
@@ -269,13 +277,15 @@ const aliasFor = agentId => `zoho-${String(agentId).replace(/[^A-Za-z0-9_-]/g, "
 /** An endpoint this integration made for the agent, found by its exact alias. */
 async function findEndpointByAlias(authId, authToken, agentId) {
   const alias = aliasFor(agentId);
-  for (let offset = 0, pages = 0; pages < 20; pages += 1, offset += 100) {
+  // Paged like applications: at most 20 per page, whatever `limit` asks for.
+  for (let offset = 0, pages = 0; pages < 100; pages += 1) {
     const r = await vobiz(authId, authToken, "GET", `/Endpoint/?limit=100&offset=${offset}`);
     if (!r.ok) return null;
     const objects = Array.isArray(r.json.objects) ? r.json.objects : [];
     const hit = objects.find(e => e && e.alias === alias && e.endpoint_id != null && e.username);
     if (hit) return { endpointId: String(hit.endpoint_id), username: String(hit.username) };
     if (!r.json.meta || !r.json.meta.next || objects.length === 0) return null;
+    offset += objects.length;
   }
   return null;
 }
