@@ -12,7 +12,7 @@
  *
  * Route groups and who may call them (see auth.js):
  *   public   /health, /agent-phone, /jssip.min.js, /admin/login
- *   agent    /agent/me, /call-events,            vz_agent cookie
+ *   agent    /agent/me, /call-events(/poll),     vz_agent cookie
  *            /agent/vobiz-session, /agent/sip-session,
  *            /agent/caller-id, /agent/enable-inbound,
  *            /agent/inbound-answered, /agent/call-failed
@@ -99,6 +99,9 @@ const pendingClickWindowMs = () => Number(process.env.CLICK_TO_DIAL_TIMEOUT_MS) 
 
 const MAX_BODY_BYTES = 64 * 1024;
 
+// How often an idle agent event stream gets a keepalive comment.
+const sseKeepaliveMs = () => Number(process.env.SSE_KEEPALIVE_MS) || 25_000;
+
 // Vobiz webhooks must carry a valid signature unless this is explicitly
 // "false" (the old verify-and-warn behaviour, for debugging a mismatch).
 const signatureRequired = () => String(process.env.REQUIRE_VOBIZ_SIGNATURE || "").trim().toLowerCase() !== "false";
@@ -163,11 +166,64 @@ const tabIdOf = raw => (/^[A-Za-z0-9-]{8,64}$/.test(String(raw || "")) ? String(
 function lineTabStream(agentId) {
   const listeners = callEventListeners.get(agentId);
   if (!listeners || !listeners.size) return null;
-  const all = [...listeners];
+  const all = [...listeners].filter(isLive);
+  if (!all.length) return null;
   const lineTab = lineTabs.get(agentId);
   if (lineTab) return all.find(res => res.vobizTab === lineTab) || null;
   return all[all.length - 1];
 }
+
+// How long a polling tab counts as connected after its last poll.
+const pollStaleMs = () => Number(process.env.CALL_EVENTS_POLL_STALE_MS) || 15_000;
+const MAX_POLL_QUEUE = 50;
+
+/** A stream is live while it is open; a polling tab while it keeps polling. */
+const isLive = listener => !listener.vobizPoller || Date.now() - listener.lastSeen < pollStaleMs();
+
+/**
+ * A softphone tab that fetches its events with short requests instead of the
+ * event stream, because something on its network path holds the stream back
+ * (Cloudflare's quick tunnels do: nothing reaches the browser, not even the
+ * greeting). It sits among the agent's listeners like a stream and takes the
+ * same writes, so every event reaches it; GET /call-events/poll hands over
+ * what has queued up. A stream of the same tab is dropped: the page closed it
+ * and must not be picked for that tab's clicks.
+ */
+function pollListener(agentId, tab) {
+  const listeners = callEventListeners.get(agentId) || new Set();
+  callEventListeners.set(agentId, listeners);
+  let poller = [...listeners].find(l => l.vobizPoller && l.vobizTab === tab);
+  if (!poller) {
+    for (const l of [...listeners]) {
+      if (!l.vobizPoller && l.vobizTab === tab) {
+        listeners.delete(l);
+        try { l.end(); } catch { /* already closed */ }
+      }
+    }
+    poller = {
+      vobizPoller: true,
+      vobizTab: tab,
+      lastSeen: 0,
+      queue: [],
+      write(payload) {
+        if (!String(payload).startsWith("data: ")) return; // keepalive comments are for streams
+        this.queue.push(String(payload).slice(6).trim());
+        if (this.queue.length > MAX_POLL_QUEUE) this.queue.shift();
+      },
+    };
+    listeners.add(poller);
+  }
+  poller.lastSeen = Date.now();
+  return poller;
+}
+
+// Polling tabs that stopped polling are forgotten.
+setInterval(() => {
+  for (const [agentId, listeners] of callEventListeners) {
+    for (const l of [...listeners]) if (!isLive(l)) listeners.delete(l);
+    if (!listeners.size) callEventListeners.delete(agentId);
+  }
+}, 5000).unref();
 
 /**
  * Click-to-dial goes to ONE tab, the one holding the phone line. Any other
@@ -1572,14 +1628,42 @@ function handleCallEvents(req, res, requestedId, url) {
   res.vobizTab = tabIdOf(url && url.searchParams.get("tab"));
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
   res.write(": connected\n\n");
+  // The page waits for this greeting. If it never arrives, the stream is
+  // being held back on the way, and the page polls instead.
+  res.write(`data: ${JSON.stringify({ type: "hello" })}\n\n`);
+  // Proxies and tunnels close a connection that carries nothing for about
+  // 100 s (Cloudflare does). The softphone then reconnects, and a click that
+  // arrives in that gap is AGENT_OFFLINE. A comment line keeps it open.
+  const keepalive = setInterval(() => res.write(": keepalive\n\n"), sseKeepaliveMs());
+  keepalive.unref();
   if (!callEventListeners.has(agentId)) callEventListeners.set(agentId, new Set());
   callEventListeners.get(agentId).add(res);
   req.on("close", () => {
+    clearInterval(keepalive);
     const listeners = callEventListeners.get(agentId);
     if (!listeners) return;
     listeners.delete(res);
     if (listeners.size === 0) callEventListeners.delete(agentId);
   });
+}
+
+/**
+ * Events for a softphone tab that cannot use the event stream: whatever queued
+ * up since its last poll, each handed over once. Polling also keeps the tab
+ * counted as connected, so a click-to-dial reaches it. The agent is the one
+ * the session cookie names; the tab id says which of their tabs is asking.
+ */
+function handleCallEventsPoll(req, res, url) {
+  const agentId = auth.agentFromRequest(req);
+  if (!agentId || !getAgent(agentId)) return sendJson(res, 401, { error: "not signed in" });
+  const tab = tabIdOf(url.searchParams.get("tab"));
+  if (!tab) return sendJson(res, 400, { error: "a tab id is required" });
+  const poller = pollListener(agentId, tab);
+  const events = poller.queue.splice(0).map(s => {
+    try { return JSON.parse(s); } catch { return null; }
+  }).filter(Boolean);
+  res.setHeader("Cache-Control", "no-store");
+  sendJson(res, 200, { events });
 }
 
 function handleAdminLoginForm(req, res) {
@@ -1719,6 +1803,7 @@ const routes = {
   "POST /agent/inbound-answered": wrap(handleInboundAnswered),
   "POST /agent/call-failed": wrap(handleCallFailed),
   "GET /call-events": (req, res, url) => handleCallEvents(req, res, null, url),
+  "GET /call-events/poll": (req, res, url) => handleCallEventsPoll(req, res, url),
 };
 
 function dispatch(req, res) {
