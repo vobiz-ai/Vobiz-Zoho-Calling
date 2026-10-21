@@ -190,6 +190,13 @@ function escapeXml(str) {
   }[c]));
 }
 
+/**
+ * A URL as an XML attribute value. A raw "&" between query parameters makes
+ * the document not well-formed, and Vobiz then rejects the whole answer
+ * ("Invalid Answer XML", hangup cause 8011): the browser's call fails as Busy.
+ */
+const xmlUrl = url => escapeXml(url);
+
 function sendJson(res, status, payload, headers = {}) {
   res.writeHead(status, { "Content-Type": "application/json", ...headers });
   res.end(JSON.stringify(payload, null, 2));
@@ -437,19 +444,18 @@ function authenticateWebhook(req, url, body) {
  * leg was answered.
  */
 function vobizXmlDialCustomer(to, callerId, agentId, authId, publicBaseUrl) {
-  // Same raw "&" in the attribute as the inbound XML that has run live.
   const qs = `agentId=${encodeURIComponent(agentId)}&authId=${encodeURIComponent(authId)}`;
   const callerIdAttr = callerId ? ` callerId="${escapeXml(callerId)}"` : "";
   // <Record> is a sibling before <Dial>, never nested. OUTBOUND_RECORD=false
   // drops it; the call log then lands from /dial-result without audio.
   const record = outboundRecordEnabled()
-    ? `  <Record recordSession="true" redirect="false" playBeep="false" fileFormat="mp3"\n    callbackUrl="${publicBaseUrl}/recording-ready?${qs}" callbackMethod="POST"/>\n`
+    ? `  <Record recordSession="true" redirect="false" playBeep="false" fileFormat="mp3"\n    callbackUrl="${xmlUrl(`${publicBaseUrl}/recording-ready?${qs}`)}" callbackMethod="POST"/>\n`
     : "";
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
 ${record}  <Dial${callerIdAttr} timeout="30" timeLimit="14400" redirect="false" method="POST"
-    action="${publicBaseUrl}/dial-result?${qs}"
-    callbackUrl="${publicBaseUrl}/dial-event?${qs}" callbackMethod="POST">
+    action="${xmlUrl(`${publicBaseUrl}/dial-result?${qs}`)}"
+    callbackUrl="${xmlUrl(`${publicBaseUrl}/dial-event?${qs}`)}" callbackMethod="POST">
     <Number>${escapeXml(String(to).replace(/^\+/, ""))}</Number>
   </Dial>
   <Hangup/>
@@ -468,18 +474,18 @@ function vobizXmlInboundToAgents(agents, authId, publicBaseUrl, dialedNumber) {
   const destinations = agents.map(a => `    <User>sip:${escapeXml(a.sipUser)}@registrar.vobiz.ai</User>`);
   // <Record> is a sibling before <Dial>, never nested.
   const inboundRecord = process.env.INBOUND_RECORD === "true"
-    ? `  <Record recordSession="true" redirect="false" playBeep="false" fileFormat="mp3"\n    callbackUrl="${publicBaseUrl}/recording-ready?${qs}" callbackMethod="POST"/>\n`
+    ? `  <Record recordSession="true" redirect="false" playBeep="false" fileFormat="mp3"\n    callbackUrl="${xmlUrl(`${publicBaseUrl}/recording-ready?${qs}`)}" callbackMethod="POST"/>\n`
     : "";
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
 ${inboundRecord}  <Dial${callerIdAttr} timeout="20" redirect="false" method="POST"
-    action="${publicBaseUrl}/dial-result?${qs}"
-    callbackUrl="${publicBaseUrl}/dial-event?${qs}" callbackMethod="POST">
+    action="${xmlUrl(`${publicBaseUrl}/dial-result?${qs}`)}"
+    callbackUrl="${xmlUrl(`${publicBaseUrl}/dial-event?${qs}`)}" callbackMethod="POST">
 ${destinations.join("\n")}
   </Dial>
   <Speak>Sorry, no one is available to take your call right now. Please leave a message after the beep.</Speak>
   <Record maxLength="120" timeout="10" finishOnKey="#" playBeep="true" fileFormat="mp3"
-    callbackUrl="${publicBaseUrl}/recording-ready?${qs}" callbackMethod="POST"/>
+    callbackUrl="${xmlUrl(`${publicBaseUrl}/recording-ready?${qs}`)}" callbackMethod="POST"/>
   <Speak>Thank you. Goodbye.</Speak>
   <Hangup/>
 </Response>`;

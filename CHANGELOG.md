@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Found in live testing
+
+- **Answer XML is well-formed.** The `&` between query parameters in `callbackUrl`/`action` attributes is now escaped as `&amp;`. Unescaped, Vobiz rejected the whole answer (hangup cause 8011, "Invalid Answer XML") and every call failed as Busy.
+
 ### Integration baseline: one phone line per agent, every outcome logged, hardened callbacks, CI
 
 - **One phone line per agent.** Vobiz keeps one registration per SIP endpoint, so two tabs on one endpoint evict each other.
