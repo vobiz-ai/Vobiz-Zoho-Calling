@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Found in live testing
 
+- **An answered inbound call no longer leaves the caller on the line.** The inbound `<Dial>` used `redirect="false"`, so when the agent hung up, Vobiz carried on into the voicemail prompt and recording that followed it, and the caller was asked to leave a message after talking to the agent. The Dial now uses `redirect="true"` with a new action, `/inbound-dial-result`, which answers `<Hangup/>` when the Dial completed and the voicemail only when nobody took the call (no answer, declined, failed).
 - **Answer XML is well-formed.** The `&` between query parameters in `callbackUrl`/`action` attributes is now escaped as `&amp;`. Unescaped, Vobiz rejected the whole answer (hangup cause 8011, "Invalid Answer XML") and every call failed as Busy.
 - **The endpoint binding is read from Vobiz's resource URI.** `application` comes back as `/v1/Account/<id>/Application/<appId>/`, so the softphone no longer warns that the endpoint "could not be bound" when it was.
 - **Lists are paged 20 at a time.** Vobiz returns at most 20 applications or endpoints per page, whatever `limit` asks for. The lookups now step by what came back, so an account with more than 20 finds this integration's own instead of creating duplicates. A refused application create now names Vobiz's reason.

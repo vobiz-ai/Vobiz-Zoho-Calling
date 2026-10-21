@@ -314,8 +314,10 @@ back, click **Sign in** in the other tab. If the tab holding the line is closed,
 
 A call to a number that rings this integration rings the softphone of every agent signed in to
 the Vobiz account that owns the number. The softphone shows **Incoming call** with **Accept** and
-**Decline**; **Enter** accepts and **Escape** declines. If nobody answers in 20 seconds, the caller
-hears a voicemail prompt and can leave a message of up to 2 minutes. If no agent of that account is
+**Decline**; **Enter** accepts and **Escape** declines. If nobody answers in 20 seconds, or the agent
+declines, the caller hears a voicemail prompt and can leave a message of up to 2 minutes. Once an
+agent has answered, whoever hangs up first ends the call for both sides; the voicemail prompt is
+never played after a call that was answered. If no agent of that account is
 signed in, the caller hears that no one is available, and the call ends. A call the backend refuses
 (for example, one whose webhook signature does not verify) also hears a short message before it
 ends, never silence.
