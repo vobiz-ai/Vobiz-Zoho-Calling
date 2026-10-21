@@ -605,10 +605,25 @@ async function testInbound(orgId) {
   check("rings for 20 seconds, as documented", xml.includes('timeout="20"'));
   check("the inbound answer is well-formed XML too: every & in its callback URLs is escaped",
     !/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)/.test(xml) && xml.includes("&amp;dir=in"), xml);
-  check("then voicemail", xml.includes("leave a message"));
+  check("when the Dial ends, Vobiz asks /inbound-dial-result what comes next (redirect=\"true\")",
+    /<Dial[^>]*redirect="true"[^>]*action="https:\/\/example\.test\/inbound-dial-result\?/.test(xml), xml);
+  check("no voicemail follows the Dial in this document — it would play after an answered call too", !xml.includes("leave a message") && !xml.includes("<Speak>"), xml);
   await waitFor(() => notifies().length >= 1);
   const ring = notifies()[0];
   check("Zoho hears a received/ringing call for the mapped user", ring && ring.fields.type === "received" && ring.fields.zohouser === "600001" && ring.fields.from === "+910008000000", ring && ring.fields);
+
+  // The agent answered, talked and hung up: the caller's side ends too.
+  let next = await (await post("/inbound-dial-result?agentId=priya&authId=MA_TEST0001&dir=in",
+    { CallUUID: "in-uuid-1", From: "910008000000", To: "910000000001", DialStatus: "completed", DialBLegUUID: "bleg-in-x" })).text();
+  check("after an answered call ends, the caller is hung up — no voicemail prompt", next.includes("<Hangup/>") && !next.includes("<Speak>") && !next.includes("<Record"), next);
+  // Nobody answered, or the agent declined: voicemail.
+  for (const status of ["no-answer", "busy"]) {
+    next = await (await post("/inbound-dial-result?agentId=priya&authId=MA_TEST0001&dir=in",
+      { CallUUID: "in-uuid-1", From: "910008000000", To: "910000000001", DialStatus: status })).text();
+    check(`a call nobody took (DialStatus ${status}) goes to voicemail`,
+      next.includes("leave a message") && /<Record maxLength="120"[^>]*callbackUrl="https:\/\/example\.test\/recording-ready\?/.test(next) && next.trim().endsWith("<Hangup/>\n</Response>"), next);
+  }
+  check("and the voicemail XML is well-formed: every & is escaped", !/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)/.test(next), next);
 
   received.length = 0;
   await finalizeZohoPhoneBridgeCall("in-uuid-1");
@@ -1082,6 +1097,8 @@ async function testWebhookSignatures() {
   xml = await (await post("/answer", { CallUUID: "sig-x-1", From: "sip:stranger@registrar.vobiz.ai", To: "910000900092" })).text();
   check("an unsigned webhook that belongs to nobody here is refused", xml.includes("<Hangup/>") && !xml.includes("<Number>"), xml);
   check("with a spoken message there too", xml.includes("<Speak>This call cannot be connected right now.</Speak>"), xml);
+  xml = await (await post("/inbound-dial-result?agentId=priya&authId=MA_TEST0001&dir=in", { CallUUID: "sig-in-3", From: "910008000020", To: "910000000001", DialStatus: "no-answer" })).text();
+  check("an unsigned inbound-dial-result gets a bare hangup, never the voicemail flow", xml.includes("<Hangup/>") && !xml.includes("<Record"), xml);
 
   process.env.REQUIRE_VOBIZ_SIGNATURE = "false";
   xml = await (await post("/answer", inbound("sig-in-7"))).text();

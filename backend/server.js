@@ -23,7 +23,8 @@
  *            /zoho/phonebridge/callback           signed OAuth state
  *            /zoho/phonebridge/recording          HMAC-signed, expiring link
  *   Vobiz    /answer, /hangup, /inbound-answer, /dial-event, /dial-result,
- *            /recording-ready                     X-Vobiz-Signature-V3 (or V2,
+ *            /inbound-dial-result, /recording-ready
+ *                                                 X-Vobiz-Signature-V3 (or V2,
  *                                                 MA-V3, MA-V2), REQUIRED by
  *                                                 default, checked with the token
  *                                                 of the account the webhook
@@ -532,13 +533,31 @@ function vobizXmlInboundToAgents(agents, authId, publicBaseUrl, dialedNumber) {
   const inboundRecord = process.env.INBOUND_RECORD === "true"
     ? `  <Record recordSession="true" redirect="false" playBeep="false" fileFormat="mp3"\n    callbackUrl="${xmlUrl(`${publicBaseUrl}/recording-ready?${qs}`)}" callbackMethod="POST"/>\n`
     : "";
+  // redirect="true": when the Dial ends, Vobiz asks /inbound-dial-result what
+  // comes next and runs that instead of carrying on down this document. With
+  // "false" it carried on into the voicemail prompt even after an agent had
+  // answered and hung up, so the caller was left on the line, being asked to
+  // leave a message. The trailing <Hangup/> is only a last resort.
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-${inboundRecord}  <Dial${callerIdAttr} timeout="20" redirect="false" method="POST"
-    action="${xmlUrl(`${publicBaseUrl}/dial-result?${qs}`)}"
+${inboundRecord}  <Dial${callerIdAttr} timeout="20" redirect="true" method="POST"
+    action="${xmlUrl(`${publicBaseUrl}/inbound-dial-result?${qs}`)}"
     callbackUrl="${xmlUrl(`${publicBaseUrl}/dial-event?${qs}`)}" callbackMethod="POST">
 ${destinations.join("\n")}
   </Dial>
+  <Hangup/>
+</Response>`;
+}
+
+/**
+ * What an inbound caller hears when no agent took the call (nobody answered
+ * in time, or the agent declined): a voicemail prompt, a recording of up to
+ * two minutes, and a goodbye.
+ */
+function vobizXmlVoicemail(agentId, authId, publicBaseUrl) {
+  const qs = `agentId=${encodeURIComponent(agentId || "")}&authId=${encodeURIComponent(authId || "")}&dir=in`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
   <Speak>Sorry, no one is available to take your call right now. Please leave a message after the beep.</Speak>
   <Record maxLength="120" timeout="10" finishOnKey="#" playBeep="true" fileFormat="mp3"
     callbackUrl="${xmlUrl(`${publicBaseUrl}/recording-ready?${qs}`)}" callbackMethod="POST"/>
@@ -843,6 +862,41 @@ async function handleDialResult(req, res, url) {
   const body = await readBody(req).catch(() => ({}));
   const { ok, authId } = authenticateWebhook(req, url, body);
   if (!ok) return sendXml(res, EMPTY_XML);
+  noteDialFinished(body, authId);
+  sendXml(res, EMPTY_XML);
+}
+
+const HANGUP_ONLY_XML = `<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>`;
+
+/**
+ * The inbound <Dial>'s action, with redirect="true": what the caller hears
+ * next is decided here, from the Dial's result.
+ *   - "completed": an agent took the call and it has ended, so the caller's
+ *     side ends too. Whoever hangs up first, the other side is dropped.
+ *   - anything else (no answer, busy or declined, failed): voicemail.
+ * The path is part of what Vobiz signs, so only Vobiz can ask it; an
+ * unverified request gets a bare hangup and changes nothing.
+ */
+async function handleInboundDialResult(req, res, url) {
+  const body = await readBody(req).catch(() => ({}));
+  const { ok, authId } = authenticateWebhook(req, url, body);
+  if (!ok) return sendXml(res, HANGUP_ONLY_XML);
+  const tracked = noteDialFinished(body, authId);
+  const publicBaseUrl = getPublicBaseUrl();
+  if (String(body.DialStatus || "").toLowerCase() === "completed" || !publicBaseUrl) {
+    return sendXml(res, HANGUP_ONLY_XML);
+  }
+  // The agent in the callback URL comes from the tracked call, never from
+  // this request's query string.
+  sendXml(res, vobizXmlVoicemail(tracked && tracked.agentId, authId, publicBaseUrl));
+}
+
+/**
+ * What every Dial result does, outbound or inbound: tell the agent's softphone
+ * the call ended, and make sure the call log lands even if no recording ever
+ * arrives. Returns the call this backend is tracking, if any.
+ */
+function noteDialFinished(body, authId) {
   console.log(`[backend] dial finished — DialStatus=${body.DialStatus} DialHangupCause=${body.DialHangupCause}`);
   const callUuid = body.CallUUID || body.DialALegUUID || body.RequestUUID;
   // The agent comes from what this backend knows about the call — the
@@ -857,13 +911,14 @@ async function handleDialResult(req, res, url) {
   // Safety net: the recording webhook is the preferred place to close a call
   // (it carries the audio), but a call with no recording never produces one.
   // finalize is idempotent, so whichever arrives first wins.
-  if (trackedFor(callUuid, authId)) {
+  const owned = trackedFor(callUuid, authId);
+  if (owned) {
     if (body.DialBLegUUID) zohoPhoneBridge.updateTrackedCall(callUuid, { bLegUuid: body.DialBLegUUID });
     setTimeout(() => {
       finalizeZohoPhoneBridgeCall(callUuid).catch(err => console.error("[zoho-pb] fallback finalize failed:", err.message));
     }, ZOHO_PB_RECORDING_GRACE_MS).unref();
   }
-  sendXml(res, EMPTY_XML);
+  return owned;
 }
 
 async function handleRecordingReady(req, res, url) {
@@ -1763,6 +1818,7 @@ const routes = {
   "GET /inbound-answer": wrap(handleInboundAnswer),
   "POST /dial-event": wrap(handleDialEvent),
   "POST /dial-result": wrap(handleDialResult),
+  "POST /inbound-dial-result": wrap(handleInboundDialResult),
   "POST /recording-ready": wrap(handleRecordingReady),
 
   // Zoho
