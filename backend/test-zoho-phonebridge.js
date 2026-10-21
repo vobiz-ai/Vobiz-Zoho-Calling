@@ -535,7 +535,9 @@ async function testClickToDial(orgId, uris) {
   check("/answer dials the customer with <Dial><Number>", /<Dial[^>]*>\s*<Number>910000900001<\/Number>/.test(xml), xml);
   check("with the agent's caller ID", xml.includes('callerId="+910000000002"'), xml);
   check("never with <Dial><User>", !xml.includes("<User>"));
-  check("and a callbackUrl to see the customer answer, naming the account", xml.includes("/dial-event?agentId=priya&authId=MA_TEST0001"), xml);
+  check("and a callbackUrl to see the customer answer, naming the account", xml.includes("/dial-event?agentId=priya&amp;authId=MA_TEST0001"), xml);
+  check("the answer is well-formed XML: every & is escaped (else Vobiz rejects it as Invalid Answer XML and the call fails Busy)",
+    !/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)/.test(xml), xml);
 
   received.length = 0;
   await post("/dial-event?agentId=priya&authId=MA_TEST0001", { Event: "DialAnswer", DialAction: "answer", CallUUID: callUuid, DialBLegUUID: "bleg-uuid-1" });
@@ -588,6 +590,8 @@ async function testInbound(orgId) {
   check("and not the other account's agent", !xml.includes(sipUserOf(arjunPhone)));
   check("the <Dial> carries callerId = the DID", xml.includes('callerId="+910000000001"'), xml);
   check("rings for 20 seconds, as documented", xml.includes('timeout="20"'));
+  check("the inbound answer is well-formed XML too: every & in its callback URLs is escaped",
+    !/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;)/.test(xml) && xml.includes("&amp;dir=in"), xml);
   check("then voicemail", xml.includes("leave a message"));
   await waitFor(() => notifies().length >= 1);
   const ring = notifies()[0];
